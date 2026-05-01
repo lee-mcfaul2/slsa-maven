@@ -1,0 +1,299 @@
+#!/usr/bin/env bash
+#
+# slsa-maven / init-container
+#
+# Scaffolds a reproducible-builder-container workflow onto a
+# Maven project. Writes two files into the target repo:
+#
+#   .github/workflows/scan.yml             (generates Dockerfile from live build)
+#   .github/workflows/build-container.yml  (publishes the image to GHCR)
+#
+# Usage:
+#   ./scripts/init-container <path-to-target-repo>
+#
+# What this does, in order:
+#   1. Validates the target is a clean git working tree with a pom.xml.
+#   2. Resolves owner/repo from the remote 'origin'.
+#   3. Detects whether the owner is a user or an org.
+#   4. Captures this slsa-maven repo's current commit SHA so the
+#      generated files can be traced back to the exact generator
+#      version.
+#   5. Creates a branch `slsa-maven-init` on the target, writes the
+#      two workflow files, commits, and (after confirmation) pushes
+#      with --set-upstream.
+#   6. Prints the PR URL.
+#
+# Dependencies: bash, git, curl, sha256sum, awk, sed.
+#
+# Does not modify any file in the target repo outside of
+# `.github/workflows/`. Project files (pom.xml, src/, etc.) are
+# never touched — the reproducibility story lives entirely at the
+# CI / environment layer.
+
+set -euo pipefail
+
+# ---- logging -----------------------------------------------------
+
+log()  { printf '==> %s\n' "$*" >&2; }
+warn() { printf '!!  %s\n' "$*" >&2; }
+die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+# ---- argument parsing --------------------------------------------
+
+show_usage() {
+  cat <<EOF
+Usage: $0 <path-to-target-repo>
+
+Scaffolds the reproducible-builder-container workflow into the
+specified Maven project.
+
+Example:
+  $0 ~/projects/my-maven-project
+EOF
+}
+
+case "${1:-}" in
+  -h|--help)
+    show_usage
+    exit 0
+    ;;
+  "")
+    show_usage >&2
+    exit 1
+    ;;
+esac
+
+if [ $# -ne 1 ]; then
+  show_usage >&2
+  exit 1
+fi
+
+TARGET="$1"
+
+# ---- locate this script's repo (for SHA + URL) -------------------
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+GENERATOR_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
+TEMPLATES_DIR="${GENERATOR_ROOT}/templates/workflows"
+
+[ -d "${TEMPLATES_DIR}" ] || die "templates directory not found at ${TEMPLATES_DIR}"
+[ -f "${TEMPLATES_DIR}/scan.yml" ] || die "scan.yml template missing"
+[ -f "${TEMPLATES_DIR}/build-container.yml" ] || die "build-container.yml template missing"
+
+GENERATOR_SHA=$(git -C "${GENERATOR_ROOT}" rev-parse HEAD 2>/dev/null) \
+  || die "slsa-maven repo at ${GENERATOR_ROOT} is not a git checkout — cannot record generator SHA"
+
+GENERATOR_URL=$(git -C "${GENERATOR_ROOT}" remote get-url origin 2>/dev/null || true)
+if [ -n "${GENERATOR_URL}" ]; then
+  # Normalize SSH → HTTPS so the header link is clickable.
+  GENERATOR_URL=$(printf '%s\n' "${GENERATOR_URL}" \
+    | sed -E 's#^git@github\.com:#https://github.com/#; s#\.git$##')
+else
+  GENERATOR_URL="https://github.com/<owner>/slsa-maven"
+  warn "slsa-maven has no 'origin' remote; using placeholder URL in headers"
+fi
+
+log "Generator: ${GENERATOR_URL} @ ${GENERATOR_SHA}"
+
+# ---- validate target ---------------------------------------------
+
+[ -d "${TARGET}" ] || die "target path does not exist: ${TARGET}"
+[ -d "${TARGET}/.git" ] || die "target is not a git repository: ${TARGET}"
+
+TARGET=$(cd "${TARGET}" && pwd)
+log "Target: ${TARGET}"
+
+# slsa-maven scaffolds Maven projects. A pom.xml at the repo root
+# is the gate — multi-module reactor projects with no top-level
+# pom, or non-Maven projects, are out of scope.
+[ -f "${TARGET}/pom.xml" ] \
+  || die "no pom.xml at target root — slsa-maven only scaffolds Maven projects"
+
+# Refuse to run against a dirty tree. Users need a clean baseline so
+# the commit this script creates is auditable.
+if ! git -C "${TARGET}" diff --quiet || ! git -C "${TARGET}" diff --cached --quiet; then
+  die "target repo has uncommitted changes; commit or stash them before running"
+fi
+
+ORIGIN_URL=$(git -C "${TARGET}" remote get-url origin 2>/dev/null) \
+  || die "target has no 'origin' remote configured"
+
+# Strip scheme + trailing .git; result should be "host/owner/repo".
+STRIPPED=$(printf '%s\n' "${ORIGIN_URL}" \
+  | sed -E 's#^(https?://|git@)##; s#^([^/:]+)[:/]#\1/#; s#\.git$##')
+
+case "${STRIPPED}" in
+  github.com/*/*)  ;;
+  *) die "origin is not on github.com (got: ${ORIGIN_URL}); slsa-maven supports GitHub only" ;;
+esac
+
+OWNER=$(printf '%s\n' "${STRIPPED}" | awk -F/ '{print $2}')
+REPO=$(printf '%s\n' "${STRIPPED}"  | awk -F/ '{print $3}')
+
+[ -n "${OWNER}" ] && [ -n "${REPO}" ] || die "could not parse owner/repo from origin: ${ORIGIN_URL}"
+
+log "Detected repo: ${OWNER}/${REPO}"
+
+# ---- detect owner type (user vs org) -----------------------------
+#
+# Same logic as slsa-autotools' init-container: HEAD against
+# /orgs/{owner}, 200 = org, 404 = user, anything else falls back to
+# user with a warning. The emitted build-container.yml's GHCR
+# existence-check uses /users/ vs /orgs/ depending on this.
+
+log "Checking whether ${OWNER} is a user or organization..."
+
+HTTP_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
+  -H 'Accept: application/vnd.github+json' \
+  -H 'User-Agent: slsa-maven-init-container' \
+  "https://api.github.com/orgs/${OWNER}" 2>/dev/null || true)
+
+case "${HTTP_STATUS}" in
+  200)
+    OWNER_TYPE_PATH=orgs
+    log "${OWNER} is an organization"
+    ;;
+  404)
+    OWNER_TYPE_PATH=users
+    log "${OWNER} is a user account"
+    ;;
+  "")
+    OWNER_TYPE_PATH=users
+    warn "Could not reach api.github.com; defaulting to user account."
+    warn "If ${OWNER} is an organization, edit the emitted build-container.yml"
+    warn "and change '/users/' to '/orgs/' in the existence-check step."
+    ;;
+  *)
+    OWNER_TYPE_PATH=users
+    warn "Unexpected HTTP ${HTTP_STATUS} from api.github.com; defaulting to user account."
+    warn "If ${OWNER} is an organization, edit the emitted build-container.yml"
+    warn "and change '/users/' to '/orgs/' in the existence-check step."
+    ;;
+esac
+
+# ---- pick the source branch to base our new branch on ------------
+
+SRC_BRANCH=$(curl -sS \
+  -H 'Accept: application/vnd.github+json' \
+  -H 'User-Agent: slsa-maven-init-container' \
+  "https://api.github.com/repos/${OWNER}/${REPO}" 2>/dev/null \
+  | sed -n 's/.*"default_branch"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+  | head -1 || true)
+if [ -z "${SRC_BRANCH}" ]; then
+  warn "Could not fetch default_branch from api.github.com; falling back to local origin/HEAD."
+  SRC_BRANCH=$(git -C "${TARGET}" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null \
+    | sed 's#^origin/##' || true)
+fi
+if [ -z "${SRC_BRANCH}" ]; then
+  SRC_BRANCH=$(git -C "${TARGET}" rev-parse --abbrev-ref HEAD)
+  warn "Could not determine default branch from origin either; using current HEAD: ${SRC_BRANCH}"
+fi
+log "Default branch (from remote): ${SRC_BRANCH}"
+
+git -C "${TARGET}" remote set-head origin "${SRC_BRANCH}" >/dev/null 2>&1 || true
+git -C "${TARGET}" fetch origin "${SRC_BRANCH}" >/dev/null 2>&1 || true
+
+TOPIC_BRANCH=slsa-maven-init
+
+if git -C "${TARGET}" show-ref --verify --quiet "refs/heads/${TOPIC_BRANCH}"; then
+  die "target already has branch '${TOPIC_BRANCH}'. Delete it (git branch -D ${TOPIC_BRANCH}) and re-run."
+fi
+
+# ---- render templates -------------------------------------------
+
+render_template() {
+  local src="$1"
+  local dst="$2"
+  sed \
+    -e "s|{{GENERATOR_URL}}|${GENERATOR_URL}|g" \
+    -e "s|{{GENERATOR_SHA}}|${GENERATOR_SHA}|g" \
+    -e "s|{{OWNER_TYPE_PATH}}|${OWNER_TYPE_PATH}|g" \
+    "${src}" > "${dst}"
+}
+
+STAGING_DIR=$(mktemp -d)
+trap 'rm -rf "${STAGING_DIR}"' EXIT
+
+render_template "${TEMPLATES_DIR}/scan.yml"            "${STAGING_DIR}/scan.yml"
+render_template "${TEMPLATES_DIR}/build-container.yml" "${STAGING_DIR}/build-container.yml"
+
+if grep -l '{{[A-Z_]*}}' "${STAGING_DIR}"/*.yml >/dev/null 2>&1; then
+  warn "Rendered templates still contain placeholders:"
+  grep -H '{{[A-Z_]*}}' "${STAGING_DIR}"/*.yml >&2 || true
+  die "template rendering incomplete — refusing to write to target"
+fi
+
+# ---- show plan and ask for confirmation --------------------------
+
+cat <<EOF
+
+slsa-maven is about to:
+
+  - create branch:     ${TOPIC_BRANCH}  (based on ${SRC_BRANCH})
+  - write files:       ${TARGET}/.github/workflows/scan.yml
+                       ${TARGET}/.github/workflows/build-container.yml
+  - commit:            "Add slsa-maven container build workflow"
+  - push:              origin ${TOPIC_BRANCH}
+
+The scan workflow will run as soon as the branch is pushed; it
+will generate a Dockerfile and commit it to the same branch.
+
+EOF
+
+printf 'Continue? [y/N] '
+read -r REPLY
+case "${REPLY}" in
+  y|Y|yes|YES) ;;
+  *) die "aborted by user" ;;
+esac
+
+# ---- apply to target repo ----------------------------------------
+
+cd "${TARGET}"
+
+if git rev-parse --verify --quiet "refs/remotes/origin/${SRC_BRANCH}" >/dev/null; then
+  BASE_REF="refs/remotes/origin/${SRC_BRANCH}"
+else
+  BASE_REF="refs/heads/${SRC_BRANCH}"
+fi
+
+log "Creating branch ${TOPIC_BRANCH} from ${BASE_REF}"
+git checkout -b "${TOPIC_BRANCH}" "${BASE_REF}"
+
+mkdir -p .github/workflows
+cp "${STAGING_DIR}/scan.yml"            .github/workflows/scan.yml
+cp "${STAGING_DIR}/build-container.yml" .github/workflows/build-container.yml
+
+git add .github/workflows/scan.yml .github/workflows/build-container.yml
+
+git commit -m "Add slsa-maven container build workflow
+
+Generated by slsa-maven ${GENERATOR_SHA}
+${GENERATOR_URL}
+
+Next steps:
+  1. Review this PR.
+  2. After merge (or on first push to this branch), scan.yml
+     will run and commit a Dockerfile to the same branch.
+  3. Review and merge that Dockerfile; build-container.yml
+     will then publish the pinned builder image to GHCR.
+"
+
+log "Pushing ${TOPIC_BRANCH} to origin..."
+git push --set-upstream origin "${TOPIC_BRANCH}"
+
+# ---- print PR URL ------------------------------------------------
+
+cat <<EOF
+
+Branch pushed.
+
+Open a PR:
+
+  https://github.com/${OWNER}/${REPO}/pull/new/${TOPIC_BRANCH}
+
+The scan workflow is already running (triggered by the push).
+Its first job will commit a Dockerfile to this branch within a
+few minutes; the PR will update automatically.
+
+EOF

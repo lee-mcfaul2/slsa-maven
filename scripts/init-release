@@ -1,0 +1,302 @@
+#!/usr/bin/env bash
+#
+# slsa-maven / init-release
+#
+# Scaffolds a reproducible release workflow onto a project that
+# has already been through init-container (i.e., has a Dockerfile
+# committed and a published builder image at
+# ghcr.io/<owner>/<repo>/builder).
+#
+# Writes one file into the target repo:
+#
+#   .github/workflows/release.yml
+#
+# Usage:
+#   ./scripts/init-release <path-to-target-repo>
+#
+# What this does, in order:
+#   1. Validates the target is a clean git working tree.
+#   2. Resolves owner/repo from the remote 'origin'.
+#   3. Detects owner type (user vs. org).
+#   4. Looks up the current digest of the builder image tagged
+#      :latest at ghcr.io/<owner>/<repo>/builder. Fails cleanly if
+#      the image doesn't exist yet.
+#   5. Captures this slsa-maven repo's SHA for provenance.
+#   6. Creates a branch `slsa-maven-init-release`, writes the
+#      release.yml with the digest pinned, commits, and (after
+#      confirmation) pushes.
+#
+# Dependencies: bash, git, curl, gh, sha256sum, awk, sed.
+
+set -euo pipefail
+
+log()  { printf '==> %s\n' "$*" >&2; }
+warn() { printf '!!  %s\n' "$*" >&2; }
+die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+show_usage() {
+  cat <<EOF
+Usage: $0 <path-to-target-repo>
+
+Scaffolds the reproducible release workflow into a Maven project.
+Requires that init-container has already been run and that a
+builder image has been published to GHCR.
+
+Example:
+  $0 ~/projects/my-maven-project
+EOF
+}
+
+case "${1:-}" in
+  -h|--help) show_usage; exit 0 ;;
+  "")        show_usage >&2; exit 1 ;;
+esac
+
+[ $# -eq 1 ] || { show_usage >&2; exit 1; }
+
+TARGET="$1"
+
+# ---- locate this script's repo ----------------------------------
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+GENERATOR_ROOT=$(cd "${SCRIPT_DIR}/.." && pwd)
+TEMPLATES_DIR="${GENERATOR_ROOT}/templates/workflows"
+
+[ -f "${TEMPLATES_DIR}/release.yml" ] || die "release.yml template missing at ${TEMPLATES_DIR}"
+
+GENERATOR_SHA=$(git -C "${GENERATOR_ROOT}" rev-parse HEAD 2>/dev/null) \
+  || die "slsa-maven is not a git checkout at ${GENERATOR_ROOT}"
+
+GENERATOR_URL=$(git -C "${GENERATOR_ROOT}" remote get-url origin 2>/dev/null || true)
+if [ -n "${GENERATOR_URL}" ]; then
+  GENERATOR_URL=$(printf '%s\n' "${GENERATOR_URL}" \
+    | sed -E 's#^git@github\.com:#https://github.com/#; s#\.git$##')
+else
+  GENERATOR_URL="https://github.com/<owner>/slsa-maven"
+  warn "slsa-maven has no 'origin' remote; using placeholder URL"
+fi
+
+log "Generator: ${GENERATOR_URL} @ ${GENERATOR_SHA}"
+
+# ---- validate target --------------------------------------------
+
+[ -d "${TARGET}" ]        || die "target path does not exist: ${TARGET}"
+[ -d "${TARGET}/.git" ]   || die "target is not a git repository: ${TARGET}"
+TARGET=$(cd "${TARGET}" && pwd)
+log "Target: ${TARGET}"
+
+# Same Maven gate as init-container — a pom.xml at the root.
+[ -f "${TARGET}/pom.xml" ] \
+  || die "no pom.xml at target root — slsa-maven only scaffolds Maven projects"
+
+if ! git -C "${TARGET}" diff --quiet || ! git -C "${TARGET}" diff --cached --quiet; then
+  die "target repo has uncommitted changes; commit or stash before running"
+fi
+
+ORIGIN_URL=$(git -C "${TARGET}" remote get-url origin 2>/dev/null) \
+  || die "target has no 'origin' remote"
+
+STRIPPED=$(printf '%s\n' "${ORIGIN_URL}" \
+  | sed -E 's#^(https?://|git@)##; s#^([^/:]+)[:/]#\1/#; s#\.git$##')
+
+case "${STRIPPED}" in
+  github.com/*/*) ;;
+  *) die "origin is not on github.com (got: ${ORIGIN_URL})" ;;
+esac
+
+OWNER=$(printf '%s\n' "${STRIPPED}" | awk -F/ '{print $2}')
+REPO=$(printf '%s\n' "${STRIPPED}"  | awk -F/ '{print $3}')
+[ -n "${OWNER}" ] && [ -n "${REPO}" ] || die "could not parse owner/repo"
+
+log "Detected repo: ${OWNER}/${REPO}"
+
+# ---- detect owner type (user vs org) ----------------------------
+
+log "Checking whether ${OWNER} is a user or organization..."
+HTTP_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' \
+  -H 'Accept: application/vnd.github+json' \
+  -H 'User-Agent: slsa-maven-init-release' \
+  "https://api.github.com/orgs/${OWNER}" 2>/dev/null || true)
+
+case "${HTTP_STATUS}" in
+  200) OWNER_TYPE_PATH=orgs  ; log "${OWNER} is an organization" ;;
+  404) OWNER_TYPE_PATH=users ; log "${OWNER} is a user account" ;;
+  *)
+    OWNER_TYPE_PATH=users
+    warn "HTTP ${HTTP_STATUS:-none} from api.github.com; defaulting to user."
+    warn "If ${OWNER} is an org, the digest lookup below will 404 — run with gh auth active."
+    ;;
+esac
+
+# ---- look up current builder image digest from GHCR --------------
+#
+# We pin to the digest that currently carries the :latest tag. Any
+# subsequent Dockerfile change triggers build-container.yml, which
+# republishes :latest over a new digest — the old one stays in the
+# registry and remains reachable by digest, but new releases need
+# this script re-run (or a manual digest bump in release.yml) to
+# adopt the new image.
+
+log "Looking up current builder image digest at ghcr.io/${OWNER}/${REPO}/builder:latest"
+PKG_PATH="${REPO}%2Fbuilder"
+
+set +e
+GH_OUTPUT=$(gh api "/${OWNER_TYPE_PATH}/${OWNER}/packages/container/${PKG_PATH}/versions" \
+  --jq '.[] | select(.metadata.container.tags[]? == "latest") | .name' 2>&1)
+GH_STATUS=$?
+set -e
+
+BUILDER_DIGEST=""
+if [ "${GH_STATUS}" -eq 0 ]; then
+  BUILDER_DIGEST=$(printf '%s\n' "${GH_OUTPUT}" | head -1 | sed 's/^sha256://')
+fi
+
+if [ -z "${BUILDER_DIGEST}" ]; then
+  cat >&2 <<EOF
+
+ERROR: could not find a :latest-tagged builder image at
+       ghcr.io/${OWNER}/${REPO}/builder
+
+gh api returned (exit ${GH_STATUS}):
+${GH_OUTPUT}
+
+Likely causes and fixes:
+  - init-container has not been run yet, or its PR has not been
+    merged to the default branch. Run scripts/init-container first.
+  - build-container.yml has not completed successfully, so no
+    image has been published. Check its run in the Actions tab.
+  - The GitHub token gh is using lacks read:packages scope. Run:
+        gh auth refresh -s read:packages
+    and then re-run this script.
+EOF
+  exit 1
+fi
+
+log "Builder digest: sha256:${BUILDER_DIGEST}"
+
+# ---- pick source branch -----------------------------------------
+
+SRC_BRANCH=$(gh api "repos/${OWNER}/${REPO}" --jq .default_branch 2>/dev/null || true)
+if [ -z "${SRC_BRANCH}" ]; then
+  warn "gh api default_branch lookup failed; falling back to local origin/HEAD."
+  SRC_BRANCH=$(git -C "${TARGET}" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null \
+    | sed 's#^origin/##' || true)
+fi
+if [ -z "${SRC_BRANCH}" ]; then
+  SRC_BRANCH=$(git -C "${TARGET}" rev-parse --abbrev-ref HEAD)
+  warn "Could not determine default branch from origin either; using current HEAD: ${SRC_BRANCH}"
+fi
+log "Default branch (from remote): ${SRC_BRANCH}"
+
+git -C "${TARGET}" remote set-head origin "${SRC_BRANCH}" >/dev/null 2>&1 || true
+git -C "${TARGET}" fetch origin "${SRC_BRANCH}" >/dev/null 2>&1 || true
+
+TOPIC_BRANCH=slsa-maven-init-release
+if git -C "${TARGET}" show-ref --verify --quiet "refs/heads/${TOPIC_BRANCH}"; then
+  die "target already has branch '${TOPIC_BRANCH}'. Delete it (git branch -D ${TOPIC_BRANCH}) and re-run."
+fi
+
+# ---- render template --------------------------------------------
+#
+# LOWERCASE_REPO: GHCR rejects uppercase characters in image
+# repository names. Job-level container.image references can't read
+# a runtime step output, so the image tag is baked in at scaffold
+# time. cosign certificate-identity URLs preserve case (github.com
+# preserves source casing for repo URLs).
+
+LOWERCASE_REPO=$(printf '%s\n' "${OWNER}/${REPO}" | tr '[:upper:]' '[:lower:]')
+
+render_template() {
+  local src="$1"
+  local dst="$2"
+  sed \
+    -e "s|{{GENERATOR_URL}}|${GENERATOR_URL}|g" \
+    -e "s|{{GENERATOR_SHA}}|${GENERATOR_SHA}|g" \
+    -e "s|{{BUILDER_DIGEST}}|${BUILDER_DIGEST}|g" \
+    -e "s|{{LOWERCASE_REPO}}|${LOWERCASE_REPO}|g" \
+    "${src}" > "${dst}"
+}
+
+STAGING_DIR=$(mktemp -d)
+trap 'rm -rf "${STAGING_DIR}"' EXIT
+render_template "${TEMPLATES_DIR}/release.yml" "${STAGING_DIR}/release.yml"
+
+if grep -l '{{[A-Z_]*}}' "${STAGING_DIR}/release.yml" >/dev/null 2>&1; then
+  grep -H '{{[A-Z_]*}}' "${STAGING_DIR}/release.yml" >&2 || true
+  die "template rendering incomplete"
+fi
+
+# ---- confirm and apply ------------------------------------------
+
+cat <<EOF
+
+slsa-maven is about to:
+
+  - create branch:     ${TOPIC_BRANCH}  (based on ${SRC_BRANCH})
+  - write file:        ${TARGET}/.github/workflows/release.yml
+  - pinned to image:   ghcr.io/${OWNER}/${REPO}/builder@sha256:${BUILDER_DIGEST}
+  - commit:            "Add slsa-maven reproducible release workflow"
+  - push:              origin ${TOPIC_BRANCH}
+
+Nothing else in the target repo is touched. After merging the PR,
+pushing a tag will trigger release.yml and produce a DRAFT release
+containing the reproducible jar/sources/javadoc/pom artifacts plus
+SLSA and cosign signatures. You then optionally GPG-sign locally
+and publish.
+
+EOF
+
+printf 'Continue? [y/N] '
+read -r REPLY
+case "${REPLY}" in
+  y|Y|yes|YES) ;;
+  *) die "aborted by user" ;;
+esac
+
+cd "${TARGET}"
+
+if git rev-parse --verify --quiet "refs/remotes/origin/${SRC_BRANCH}" >/dev/null; then
+  BASE_REF="refs/remotes/origin/${SRC_BRANCH}"
+else
+  BASE_REF="refs/heads/${SRC_BRANCH}"
+fi
+
+log "Creating branch ${TOPIC_BRANCH} from ${BASE_REF}"
+git checkout -b "${TOPIC_BRANCH}" "${BASE_REF}"
+
+mkdir -p .github/workflows
+cp "${STAGING_DIR}/release.yml" .github/workflows/release.yml
+
+git add .github/workflows/release.yml
+
+git commit -m "Add slsa-maven reproducible release workflow
+
+Generated by slsa-maven ${GENERATOR_SHA}
+${GENERATOR_URL}
+
+Pinned to builder image digest:
+  sha256:${BUILDER_DIGEST}
+
+Triggered by pushing a tag. Produces reproducible jar/sources/
+javadoc/pom artifacts (and .module if the project ships Gradle
+module metadata), SLSA provenance, cosign signatures, and a DRAFT
+release that the maintainer can GPG-sign and publish.
+"
+
+log "Pushing ${TOPIC_BRANCH} to origin..."
+git push --set-upstream origin "${TOPIC_BRANCH}"
+
+cat <<EOF
+
+Branch pushed.
+
+Open a PR:
+
+  https://github.com/${OWNER}/${REPO}/pull/new/${TOPIC_BRANCH}
+
+After merging, push a tag to create a draft release:
+
+  git tag v0.1.0
+  git push origin v0.1.0
+
+EOF
