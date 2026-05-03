@@ -52,6 +52,34 @@ on:
         description: 'Ubuntu snapshot timestamp (YYYYMMDDTHHMMSSZ)'
         required: false
         default: ''
+      apt_mirror_url:
+        # Override the apt mirror URL prefix. Defaults to
+        # snapshot.ubuntu.com at the pinned SNAPSHOT_TS. Set this
+        # when running against an internal Artifactory / proxy
+        # cache that wraps snapshot.ubuntu.com (companies running
+        # behind a corporate cache, or anyone working around the
+        # public mirror's rate limit on shared CI IP pools).
+        # The URL must end with a trailing slash; the workflow
+        # appends `<release> main restricted universe multiverse`.
+        # Maven Central is NOT mirrored here — Central isn't rate-
+        # limited and is content-addressable, so the curl URLs in
+        # the emitted Dockerfile always go to repo1.maven.org.
+        description: 'Override apt mirror URL prefix (e.g. http://artifactory:8081/.../snapshot-cache/). Empty = snapshot.ubuntu.com'
+        required: false
+        default: ''
+      dry_run:
+        # When true, generate Dockerfile.new on disk for
+        # inspection but do NOT commit or push. Use this when
+        # running the workflow locally (e.g. via act against a
+        # laptop Artifactory) so the resulting test Dockerfile —
+        # which would carry the override URL baked in — never
+        # reaches the remote. Combine with apt_mirror_url to
+        # exercise the scan against an internal cache without
+        # leaking the cache URL upstream.
+        description: 'Generate Dockerfile but skip commit/push. Use for local act runs.'
+        required: false
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -244,10 +272,33 @@ jobs:
       # release time tracks the tag, this knob tracks the build
       # environment freeze.
       SNAPSHOT_TS: ${{ inputs.snapshot_ts != '' && inputs.snapshot_ts || '20260425T120000Z' }}
+      # Override URL. If empty, the workflow uses the public
+      # snapshot.ubuntu.com default. Used for Artifactory proxies
+      # / internal apt caches / working around the public mirror's
+      # rate-limiting on shared CI IP pools. Threaded through both
+      # the live scan and the emitted Dockerfile.
+      APT_MIRROR_URL_OVERRIDE: ${{ inputs.apt_mirror_url }}
+      # Dry-run flag: when 'true', the scan job emits Dockerfile.new
+      # on disk for inspection but skips the git commit and push
+      # steps. Lets local act runs exercise the full scan against
+      # an internal Artifactory without the IP-laden test
+      # Dockerfile reaching the remote.
+      DRY_RUN: ${{ inputs.dry_run }}
       RELEASE: ${{ needs.resolve.outputs.release }}
       IMAGE_DIGEST: ${{ needs.resolve.outputs.image_digest }}
       JDK_MAJOR: ${{ needs.resolve.outputs.jdk_major }}
       JDK_PACKAGE: ${{ needs.resolve.outputs.jdk_package }}
+      # Maven from archive.apache.org. apt's maven (3.8.7 on noble
+      # LTS) is too old to satisfy modern projects' enforcer rules
+      # (commons-lang3 requires [3.9,), and Ubuntu LTS doesn't track
+      # upstream Maven release cadence). Pin a specific version +
+      # SHA512 here, same content-addressable model as cosign in
+      # build-container.yml. Bump together when refreshing
+      # slsa-maven; archive.apache.org/dist/maven/maven-3/ lists
+      # available versions and ships .sha512 files alongside each
+      # tarball.
+      MVN_VERSION: '3.9.15'
+      MVN_SHA512: '33d81e0ec785f0207e3e5e3ffb61863e1dca5784c15ac3fb5ff105f69cffbea484eb8d473ea60467a63f7b0570eef8622f2fed8eee96acbe668aa313391cddb3'
 
     steps:
       - name: Bootstrap git (pre-checkout)
@@ -265,17 +316,31 @@ jobs:
           fetch-depth: 0
           persist-credentials: true
 
-      - name: Pin apt sources to snapshot.ubuntu.com
+      - name: Pin apt sources
         run: |
           set -euo pipefail
           # Bootstrap ca-certificates from the default HTTP archive
-          # before swapping to the HTTPS-only snapshot mirror.
+          # before swapping to the (HTTPS-only) snapshot mirror.
           apt-get update -qq
           apt-get install -y --no-install-recommends ca-certificates
+
+          # Resolve the apt mirror URL: dispatch override wins,
+          # else default to public snapshot.ubuntu.com at the
+          # pinned SNAPSHOT_TS. Persist to $GITHUB_ENV so the
+          # Dockerfile-emit step bakes the same URL.
+          if [ -n "${APT_MIRROR_URL_OVERRIDE}" ]; then
+            APT_MIRROR_URL="${APT_MIRROR_URL_OVERRIDE}"
+            echo "Using apt mirror override: ${APT_MIRROR_URL}"
+          else
+            APT_MIRROR_URL="https://snapshot.ubuntu.com/ubuntu/${SNAPSHOT_TS}/"
+            echo "Using public snapshot mirror: ${APT_MIRROR_URL}"
+          fi
+          echo "APT_MIRROR_URL=${APT_MIRROR_URL}" >> "$GITHUB_ENV"
+
           cat > /etc/apt/sources.list <<APT
-          deb https://snapshot.ubuntu.com/ubuntu/${SNAPSHOT_TS}/ ${RELEASE} main restricted universe multiverse
-          deb https://snapshot.ubuntu.com/ubuntu/${SNAPSHOT_TS}/ ${RELEASE}-updates main restricted universe multiverse
-          deb https://snapshot.ubuntu.com/ubuntu/${SNAPSHOT_TS}/ ${RELEASE}-security main restricted universe multiverse
+          deb ${APT_MIRROR_URL} ${RELEASE} main restricted universe multiverse
+          deb ${APT_MIRROR_URL} ${RELEASE}-updates main restricted universe multiverse
+          deb ${APT_MIRROR_URL} ${RELEASE}-security main restricted universe multiverse
           APT
           rm -f /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list
           # snapshot.ubuntu.com aggressively rate-limits the GitHub
@@ -303,10 +368,14 @@ jobs:
           done
 
       - name: Install bootstrap toolchain
-        # Generous default set: JDK + Maven + tracing/packaging
-        # tools. Anything unused by the project simply doesn't
-        # show up in the strace output and won't land in the
-        # emitted Dockerfile.
+        # Generous default set: JDK + tracing/packaging tools.
+        # Maven is NOT installed here — apt's noble package is
+        # 3.8.7 which fails most projects' requireMavenVersion
+        # enforcer rules. Maven comes from archive.apache.org in
+        # the next step.
+        # Anything unused by the project simply doesn't show up in
+        # the strace output and won't land in the emitted
+        # Dockerfile.
         run: |
           set -euo pipefail
           apt_install() {
@@ -329,7 +398,6 @@ jobs:
           }
           apt_install \
             "${JDK_PACKAGE}" \
-            maven \
             strace \
             dpkg-dev \
             git \
@@ -342,6 +410,24 @@ jobs:
             unzip \
             tar
           git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
+      - name: Install Maven from archive.apache.org
+        # SHA512-pinned download. Apache's archive is content-
+        # addressable + immutable like Maven Central, so the SHA
+        # pin is durable indefinitely. tar -xzf with --strip-
+        # components=1 lays /opt/maven/{bin,lib,...} directly so
+        # the symlink path is stable across version bumps.
+        run: |
+          set -euo pipefail
+          MVN_TGZ=/tmp/apache-maven-${MVN_VERSION}-bin.tar.gz
+          curl -fsSL \
+            "https://archive.apache.org/dist/maven/maven-3/${MVN_VERSION}/binaries/apache-maven-${MVN_VERSION}-bin.tar.gz" \
+            -o "${MVN_TGZ}"
+          echo "${MVN_SHA512}  ${MVN_TGZ}" | sha512sum -c -
+          mkdir -p /opt/maven
+          tar -xzf "${MVN_TGZ}" -C /opt/maven --strip-components=1
+          ln -sf /opt/maven/bin/mvn /usr/local/bin/mvn
+          mvn -v | head -3
 
       - name: Run Maven build under strace
         id: trace
@@ -556,14 +642,36 @@ jobs:
           cd "${GITHUB_WORKSPACE}"
 
           {
+            # Apache 2.0 header at the top so projects that run a
+            # license-header checker (apache-rat-plugin and similar)
+            # don't fail their next CI run on this file. The header
+            # is generic Apache 2.0 — it does NOT claim ASF
+            # ownership, so it's appropriate for adopters whether
+            # or not they're an Apache project. RAT's default
+            # ApacheV2 family matcher accepts the "Licensed under
+            # the Apache License, Version 2.0" phrasing alone.
+            echo "# Licensed under the Apache License, Version 2.0 (the \"License\");"
+            echo "# you may not use this file except in compliance with the License."
+            echo "# You may obtain a copy of the License at"
+            echo "#"
+            echo "#     http://www.apache.org/licenses/LICENSE-2.0"
+            echo "#"
+            echo "# Unless required by applicable law or agreed to in writing, software"
+            echo "# distributed under the License is distributed on an \"AS IS\" BASIS,"
+            echo "# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied."
+            echo "# See the License for the specific language governing permissions and"
+            echo "# limitations under the License."
+            echo "#"
             echo "# Generated by slsa-maven scan.yml"
             echo "# {{GENERATOR_URL}} @ {{GENERATOR_SHA}}"
             echo "#"
             echo "# Every byte that ends up in this image is pinned end-to-end:"
-            echo "# - apt packages by version + .deb SHA256 against snapshot.ubuntu.com"
+            echo "# - apt packages by version + .deb SHA256"
             echo "# - Maven artifacts by SHA256 against repo1.maven.org/maven2/"
             echo "#"
+            echo "# Apt mirror:         ${APT_MIRROR_URL}"
             echo "# Snapshot timestamp: ${SNAPSHOT_TS}"
+            echo "# Maven:              ${MVN_VERSION} (from archive.apache.org)"
             echo "# JDK:                ${JDK_PACKAGE}"
             echo "# Ubuntu release:     ${RELEASE}"
             echo "#"
@@ -575,16 +683,16 @@ jobs:
             echo "ENV DEBIAN_FRONTEND=noninteractive"
             echo ""
             echo "# Step 1: bootstrap ca-certificates so we can reach"
-            echo "# snapshot.ubuntu.com over HTTPS."
+            echo "# the apt mirror over HTTPS."
             echo "RUN apt-get update -qq \\"
             echo " && apt-get install -y --no-install-recommends ca-certificates"
             echo ""
             echo "# Step 2: redirect apt to the pinned snapshot."
             echo "RUN set -eu \\"
             echo " && printf '%s\\n' \\"
-            echo "    'deb https://snapshot.ubuntu.com/ubuntu/${SNAPSHOT_TS}/ ${RELEASE} main restricted universe multiverse' \\"
-            echo "    'deb https://snapshot.ubuntu.com/ubuntu/${SNAPSHOT_TS}/ ${RELEASE}-updates main restricted universe multiverse' \\"
-            echo "    'deb https://snapshot.ubuntu.com/ubuntu/${SNAPSHOT_TS}/ ${RELEASE}-security main restricted universe multiverse' \\"
+            echo "    'deb ${APT_MIRROR_URL} ${RELEASE} main restricted universe multiverse' \\"
+            echo "    'deb ${APT_MIRROR_URL} ${RELEASE}-updates main restricted universe multiverse' \\"
+            echo "    'deb ${APT_MIRROR_URL} ${RELEASE}-security main restricted universe multiverse' \\"
             echo "    > /etc/apt/sources.list \\"
             echo " && rm -f /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list \\"
             echo " && apt-get update -qq"
@@ -620,33 +728,68 @@ jobs:
             echo " && apt-get clean \\"
             echo " && rm -rf /var/lib/apt/lists/*"
             echo ""
-            echo "# Step 4: pre-populate the Maven local repository."
+            echo "# Step 4: install Maven from archive.apache.org. apt's"
+            echo "# Maven (3.8.7 on noble LTS) fails most projects'"
+            echo "# requireMavenVersion enforcer rule. Apache's archive is"
+            echo "# content-addressable + immutable, so the SHA512 pin is"
+            echo "# durable indefinitely."
+            echo "RUN set -eux \\"
+            echo " && curl -fsSL 'https://archive.apache.org/dist/maven/maven-3/${MVN_VERSION}/binaries/apache-maven-${MVN_VERSION}-bin.tar.gz' -o /tmp/maven.tgz \\"
+            echo " && echo '${MVN_SHA512}  /tmp/maven.tgz' | sha512sum -c - \\"
+            echo " && mkdir -p /opt/maven \\"
+            echo " && tar -xzf /tmp/maven.tgz -C /opt/maven --strip-components=1 \\"
+            echo " && ln -sf /opt/maven/bin/mvn /usr/local/bin/mvn \\"
+            echo " && rm -f /tmp/maven.tgz"
+            echo ""
+            echo "# Step 5: pre-populate the Maven local repository."
             echo "# Each artifact is downloaded from repo1.maven.org and"
             echo "# SHA256-verified before landing in /root/.m2/repository."
             echo "# Maven Central is content-addressable + immutable by"
             echo "# convention, so a (groupId, artifactId, version) tuple"
             echo "# resolves to one specific file forever; the SHA256"
             echo "# stamps that immutability into this Dockerfile."
-            echo "RUN set -eux \\"
-            echo " && mkdir -p /tmp/m2 /root/.m2/repository \\"
-            echo " && cd /tmp/m2 \\"
+            echo "#"
+            echo "# Chunked into batches so each RUN stays under Linux's"
+            echo "# MAX_ARG_STRLEN (~128 KB). 1390+ artifacts × ~400 char"
+            echo "# chain each is ~1.7 MB unchunked — exec aborts with"
+            echo "# 'argument list too long'. Batches of 100 are ~40 KB,"
+            echo "# comfortably under the limit; resulting layer count"
+            echo "# (a dozen or so) is well under Docker's 127-layer cap."
+            echo "RUN mkdir -p /root/.m2/repository"
 
-            # Per artifact: one curl + one sha256sum -c per file.
-            # Inlined as backslash-chained && so any failure
-            # aborts the layer.
+            # Emit one RUN per CHUNK_SIZE artifacts. Resolves the
+            # MAX_ARG_STRLEN exec failure that blew up unchunked
+            # builds against any project with more than a few hundred
+            # transitively-resolved Maven artifacts (commons-lang3
+            # produced 1390).
+            CHUNK_SIZE=100
+            TOTAL=$(wc -l < /tmp/scan/maven-pins.txt)
+            CHUNK_NUM=0
+            COUNT=0
             while IFS=$'\t' read -r sha rel; do
+              if [ $((COUNT % CHUNK_SIZE)) -eq 0 ]; then
+                # Close the previous batch (if any) with a no-op
+                # so the trailing && doesn't dangle.
+                [ ${CHUNK_NUM} -gt 0 ] && echo " && true" && echo ""
+                CHUNK_NUM=$((CHUNK_NUM + 1))
+                LAST_IN_BATCH=$((COUNT + CHUNK_SIZE))
+                [ ${LAST_IN_BATCH} -gt ${TOTAL} ] && LAST_IN_BATCH=${TOTAL}
+                echo "# Maven pin batch ${CHUNK_NUM} (entries $((COUNT + 1))-${LAST_IN_BATCH} of ${TOTAL})"
+                echo "RUN set -eux \\"
+              fi
               # Target dir is the parent of the artifact's path
               # under /root/.m2/repository; mkdir -p is idempotent
               # and harmless if the same artifactId has multiple
               # files (jar + pom + module).
               dir=$(dirname "${rel}")
-              file=$(basename "${rel}")
               echo " && mkdir -p '/root/.m2/repository/${dir}' \\"
               echo " && curl -fsSL 'https://repo1.maven.org/maven2/${rel}' -o '/root/.m2/repository/${rel}' \\"
               echo " && echo '${sha}  /root/.m2/repository/${rel}' | sha256sum -c - \\"
+              COUNT=$((COUNT + 1))
             done < /tmp/scan/maven-pins.txt
 
-            # Trailing no-op so the last && doesn't dangle.
+            # Trailing no-op so the last && in the final batch
+            # doesn't dangle.
             echo " && true"
             echo ""
             echo "# Re-register any workspace as a safe git directory for"
@@ -670,6 +813,17 @@ jobs:
           fi
           mv Dockerfile.new Dockerfile
 
+          # Dry-run path: leave Dockerfile in place for inspection
+          # but skip every git operation. Used by local act runs
+          # against an internal Artifactory cache where the override
+          # URL must not reach the remote.
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "DRY_RUN=true — Dockerfile written to disk; skipping commit and push."
+            echo "Inspect ${GITHUB_WORKSPACE}/Dockerfile to review the scan output."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           git config user.name  'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
           git add Dockerfile
@@ -682,7 +836,8 @@ jobs:
 
           git commit \
             -m 'Regenerate Dockerfile via slsa-maven scan' \
-            -m "Pinned to snapshot.ubuntu.com at ${SNAPSHOT_TS}." \
+            -m "Apt mirror: ${APT_MIRROR_URL}" \
+            -m "Snapshot timestamp: ${SNAPSHOT_TS}" \
             -m 'Every apt and Maven byte verified by SHA256.'
 
           # Race-tolerant push: another commit may have landed on

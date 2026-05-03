@@ -208,3 +208,46 @@ JDK versions.
 ## Status
 
 Work in progress.
+
+## Notes
+
+Real-world gaps surfaced during local validation against the
+Apache Commons Lang3 fork — recording them here because each is
+a non-obvious adopter-facing decision.
+
+### Maven from `archive.apache.org`, not from apt
+
+apt's `maven` package on Ubuntu LTS lags upstream Maven by
+years. noble (24.04 LTS) carries 3.8.7 (Jan 2023). Many projects
+declare `<requireMavenVersion>[3.9,)</requireMavenVersion>` via
+the enforcer plugin and refuse to build under 3.8.x; Apache
+Commons Lang3 is one such project. We sidestep the
+LTS-vs-upstream cadence mismatch by installing Maven from
+`archive.apache.org/dist/maven/maven-3/` by version + SHA512.
+Apache's archive is content-addressable and immutable, same
+trust model as cosign in `build-container.yml`. Bump
+`MVN_VERSION` + `MVN_SHA512` in `scan.yml` together when
+refreshing slsa-maven.
+
+### Maven pin block emitted in chunks
+
+A non-trivial Maven dep graph (commons-lang3 transitively
+resolves 1,390 jar/pom files) produces a single RUN whose `&&`
+chain exceeds Linux's `MAX_ARG_STRLEN` (~128 KB) — `exec` aborts
+with "argument list too long". The emit step batches the pin
+list into 100-artifact groups, one RUN per batch. ~14 layers for
+a project the size of commons-lang, well under Docker's 127-
+layer ceiling.
+
+### Apache 2.0 license header on the emitted Dockerfile
+
+When `scan.yml` commits the generated Dockerfile back to the
+target repo, the next CI run that touches `mvn verify` on a
+project with `apache-rat-plugin` (every Apache project, plus
+many non-Apache ones) fails the `rat-check` goal because
+Dockerfile has no recognised license header. We prepend the
+generic Apache 2.0 boilerplate — *not* the ASF-attributed
+"Licensed to the Apache Software Foundation" form, since
+adopters aren't necessarily Apache projects. The phrasing
+"Licensed under the Apache License, Version 2.0" is what RAT's
+default ApacheV2 matcher recognises.
