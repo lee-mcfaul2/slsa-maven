@@ -20,7 +20,7 @@ publishing.
 
 ## Why
 
-Most Maven releases are pushed manually from a maintainer's
+Some Maven releases are pushed manually from a maintainer's
 machine via `mvn deploy`. Even when GPG-signed, those signatures
 attest only "this maintainer approved this artifact" — not "this
 artifact was built reproducibly from a specific commit." A
@@ -64,6 +64,22 @@ The flow:
    (fully offline), a verify job byte-compares them, and if they
    match the bytes are attested, signed, and uploaded to a
    draft GitHub release.
+
+## Before you start
+
+slsa-maven adds two workflow files and (after scan runs) a
+Dockerfile to your repo. It does **not** modify your existing
+CI. Whatever your master branch's CI status is right now —
+green or red — is what your slsa-maven topic branch's PR will
+inherit. If your project has pre-existing CI red (e.g. a JDK
+early-access matrix entry that's expected to fail, a security
+workflow that needs a fork-side toggle, a flaky test) those
+will surface on the slsa-maven PR too.
+
+slsa-maven is a clean inheritance: anything red on a slsa-maven
+PR that isn't from `Scan and pin Dockerfile` was already red
+upstream. Get your master CI to where you want it before
+adopting; the PR will inherit that state.
 
 ## Quickstart
 
