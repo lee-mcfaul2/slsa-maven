@@ -3,26 +3,43 @@
 #
 # Reproducible release workflow for a Maven project.
 #
-# Triggered by pushing a tag. Produces the four (or five) standard
-# Maven release artifacts:
+# Triggered by pushing a tag. Produces the four standard Maven
+# release artifacts:
 #   - <artifactId>-<version>.jar
 #   - <artifactId>-<version>-sources.jar
 #   - <artifactId>-<version>-javadoc.jar
 #   - <artifactId>-<version>.pom
-#   - <artifactId>-<version>.module           (only if the project
-#                                              publishes Gradle
-#                                              module metadata)
 #
-# Each artifact is built twice in independent containers, byte-
-# compared, then signed two ways (SLSA build provenance + cosign
-# detached bundle). Published as a DRAFT release; the maintainer
-# may add a GPG signature locally before flipping to published.
+# Each artifact is built TWICE in independent containers — one
+# pair per file — and the two passes are byte-compared. Each
+# verified artifact is then signed two ways (SLSA build
+# provenance + cosign detached bundle). Published as a DRAFT
+# release; the maintainer may add a GPG signature locally before
+# flipping to published.
 #
 # Job graph:
 #
 #   test
-#     ├─ build_pass1   ─┐
-#     └─ build_pass2   ─┘  → verify  →  publish
+#     ├─ build (jar,     pass=1) ─┐
+#     ├─ build (jar,     pass=2) ─┤  → verify (jar)     ─┐
+#     ├─ build (sources, pass=1) ─┤                      │
+#     ├─ build (sources, pass=2) ─┤  → verify (sources) ─┤
+#     ├─ build (javadoc, pass=1) ─┤                      ├─ publish
+#     ├─ build (javadoc, pass=2) ─┤  → verify (javadoc) ─┤
+#     ├─ build (pom,     pass=1) ─┤                      │
+#     └─ build (pom,     pass=2) ─┘  → verify (pom)     ─┘
+#
+# 1 + 8 + 4 + 1 = 14 jobs. The 8 build jobs and 4 verify jobs are
+# each one matrix-spec, not 12 copy-pasted definitions.
+#
+# Why one pair per file? Per-artifact isolation. A flaky javadoc
+# generation can't taint the jar bit-compare. Each artifact gets
+# its own SLSA attestation + cosign signature scoped to bytes,
+# not a "release-bundle" attestation that hides which artifact
+# actually drifted. The pom pair is included for symmetry — the
+# pom "build" is just a file copy from the source tree, so the
+# bytes are guaranteed-identical, but the pair is still present
+# as audit evidence that nothing edited the pom between passes.
 #
 # Reproducibility envelope:
 #   - SOURCE_DATE_EPOCH from `git log -1 --format=%ct <tag>`,
@@ -115,14 +132,28 @@ jobs:
           set -euo pipefail
           mvn -o -B verify
 
-  # Two parallel build jobs in independent containers at the same
-  # ${GITHUB_WORKSPACE}. Identical absolute pwd between passes
-  # means anything that bakes the build path into output bakes the
-  # SAME path in both passes by construction — the bit-compare in
-  # `verify` then holds without per-target workarounds.
-  build_pass1:
-    name: Build artifacts (pass 1)
+  # One pair (pass=1 + pass=2) per release artifact, eight build
+  # jobs total. Each matrix entry runs ONE focused mvn goal that
+  # produces ONE artifact, then uploads that one file. This keeps
+  # per-artifact isolation: a non-deterministic javadoc render
+  # only fails the javadoc pair's bit-compare, not the jar's.
+  #
+  # Both passes of a given artifact share `${GITHUB_WORKSPACE}` as
+  # their absolute pwd inside their respective containers — same
+  # path in both, so anything that bakes the build path into output
+  # bakes the SAME path in both passes by construction.
+  #
+  # fail-fast: false lets all eight build jobs run to completion
+  # even if one pair fails early; the verify jobs that depend on
+  # each pair report their own bit-compare result independently.
+  build:
+    name: Build ${{ matrix.artifact }} (pass ${{ matrix.pass }})
     needs: test
+    strategy:
+      fail-fast: false
+      matrix:
+        artifact: [jar, sources, javadoc, pom]
+        pass: [1, 2]
     runs-on: ubuntu-24.04
     container:
       image: ghcr.io/{{LOWERCASE_REPO}}/builder@sha256:{{BUILDER_DIGEST}}
@@ -146,15 +177,6 @@ jobs:
 
       - name: Derive version and SOURCE_DATE_EPOCH
         id: meta
-        # VERSION derivation: strip 'v' or 'rel/<artifact>-' prefix
-        # so commons-lang's `rel/commons-lang-3.18.0` and a
-        # semver-style `v3.18.0` both resolve to `3.18.0`. The
-        # canonical version is what the pom's <version> field
-        # holds; we read it via mvn help:evaluate after this step
-        # rather than trusting the tag-derived form for artifact
-        # filenames.
-          # Same SOURCE_DATE_EPOCH derivation as the test job —
-          # tag commit timestamp, not workflow run.
         run: |
           set -eu
           SDE=$(git log -1 --format=%ct "${GITHUB_REF_NAME}")
@@ -164,14 +186,13 @@ jobs:
             echo "iso_ts=${ISO_TS}"
           } >> "$GITHUB_OUTPUT"
           echo "SOURCE_DATE_EPOCH=${SDE}" >> "$GITHUB_ENV"
-          echo "SOURCE_DATE_EPOCH = ${SDE} (${ISO_TS})"
 
       - name: Read project coordinates from pom
         id: coords
         # Authoritative artifactId / version come from `mvn
         # help:evaluate`, which resolves inherited values from the
-        # parent pom hierarchy. xmllint on the project pom alone
-        # would miss anything inherited.
+        # parent pom hierarchy. Used by every matrix entry to
+        # compute its target artifact filename.
         run: |
           set -eu
           ARTIFACT_ID=$(mvn -o -B -q -DforceStdout help:evaluate -Dexpression=project.artifactId)
@@ -180,157 +201,92 @@ jobs:
             echo "artifact_id=${ARTIFACT_ID}"
             echo "version=${VERSION}"
           } >> "$GITHUB_OUTPUT"
-          echo "Artifact: ${ARTIFACT_ID}-${VERSION}"
 
-      - name: Build artifacts (offline, reproducible)
-        # -o:                offline — fails loudly if any byte
-        #                    needs to come from the network.
-        # -Dproject.build.outputTimestamp=<ISO>:
-        #                    overrides whatever the pom committed.
-        #                    Maven's archiver uses this for ZIP
-        #                    entry mtimes; setting it from SDE
-        #                    means a stale pom timestamp can't
-        #                    drift between pass1 and pass2.
-        # -Dnotimestamp=true: passed to maven-javadoc-plugin to
-        #                    suppress the dc.created <meta> tag
-        #                    in generated HTML.
-        # -DskipTests:       tests already ran in the test job;
-        #                    re-running here would just slow things
-        #                    down. The user's call: "no point in
-        #                    running unit tests twice."
-        # -Dmaven.repo.local: pin to the image-prepopulated repo at
-        #                    /root/.m2/repository (mvn's default
-        #                    when running as root).
-        run: |
-          set -euo pipefail
-          mvn -o -B \
-              -Dproject.build.outputTimestamp="${{ steps.meta.outputs.iso_ts }}" \
-              -Dnotimestamp=true \
-              -DskipTests \
-              package source:jar javadoc:jar
-
-      - name: Stage release artifacts
+      - name: Build ${{ matrix.artifact }}
+        # Per-artifact mvn goal:
+        #   jar     — `mvn -o package -DskipTests` runs validate →
+        #             ... → compile → test-compile → package
+        #             (Surefire skipped: tests already ran in the
+        #             test job; running them again per-pair would
+        #             quadruple wall time).
+        #   sources — `mvn -o source:jar` is a standalone goal
+        #             (the source plugin's `jar` mojo doesn't
+        #             require any preceding phase). Just zips the
+        #             configured source roots.
+        #   javadoc — `mvn -o javadoc:jar` requires compile (the
+        #             javadoc tool needs class context to resolve
+        #             cross-references), so it triggers
+        #             validate → ... → compile → javadoc:jar.
+        #             -Dnotimestamp=true suppresses the
+        #             dc.created HTML <meta> stamp.
+        #   pom     — pure file copy. The pom released to Central
+        #             is the project's pom.xml renamed to the
+        #             standard convention. No mvn invocation; the
+        #             two passes producing identical bytes is a
+        #             tautology, but the pair is here for the same
+        #             audit evidence the others provide.
         env:
+          ARTIFACT_TYPE: ${{ matrix.artifact }}
           ARTIFACT_ID: ${{ steps.coords.outputs.artifact_id }}
           VERSION: ${{ steps.coords.outputs.version }}
+          ISO_TS: ${{ steps.meta.outputs.iso_ts }}
         run: |
           set -euo pipefail
           mkdir -p dist
-          # Copy the jar artifacts produced by `package` /
-          # `source:jar` / `javadoc:jar`. All four (jar, sources,
-          # javadoc, .module if present) live under target/.
-          cp "target/${ARTIFACT_ID}-${VERSION}.jar"          "dist/"
-          cp "target/${ARTIFACT_ID}-${VERSION}-sources.jar"  "dist/"
-          cp "target/${ARTIFACT_ID}-${VERSION}-javadoc.jar"  "dist/"
-          # The pom that gets released is the project's pom.xml,
-          # renamed to the Maven Central convention. This is what
-          # `mvn install` would copy into the local repo.
-          cp pom.xml "dist/${ARTIFACT_ID}-${VERSION}.pom"
-          # .module (Gradle module metadata) is optional. Only
-          # projects using the gradle-module-metadata-maven-plugin
-          # produce it; copy if present.
-          if [ -f "target/${ARTIFACT_ID}-${VERSION}.module" ]; then
-            cp "target/${ARTIFACT_ID}-${VERSION}.module" "dist/"
-            echo "Captured Gradle Module Metadata."
-          fi
-          echo "Pass 1 artifacts:"
+          case "${ARTIFACT_TYPE}" in
+            jar)
+              mvn -o -B \
+                  -Dproject.build.outputTimestamp="${ISO_TS}" \
+                  -DskipTests \
+                  package
+              cp "target/${ARTIFACT_ID}-${VERSION}.jar" "dist/"
+              ;;
+            sources)
+              mvn -o -B \
+                  -Dproject.build.outputTimestamp="${ISO_TS}" \
+                  source:jar
+              cp "target/${ARTIFACT_ID}-${VERSION}-sources.jar" "dist/"
+              ;;
+            javadoc)
+              mvn -o -B \
+                  -Dproject.build.outputTimestamp="${ISO_TS}" \
+                  -Dnotimestamp=true \
+                  javadoc:jar
+              cp "target/${ARTIFACT_ID}-${VERSION}-javadoc.jar" "dist/"
+              ;;
+            pom)
+              cp pom.xml "dist/${ARTIFACT_ID}-${VERSION}.pom"
+              ;;
+            *)
+              echo "ERROR: unknown matrix.artifact value: ${ARTIFACT_TYPE}" >&2
+              exit 1
+              ;;
+          esac
+          echo "Built ${ARTIFACT_TYPE} for pass ${{ matrix.pass }}:"
           ls -la dist/
 
-      - name: Upload pass 1 artifacts
+      - name: Upload artifact
+        # One-file upload, named by both artifact and pass so the
+        # corresponding verify matrix entry can pull its specific
+        # pair without ambiguity.
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: build-pass1
+          name: build-${{ matrix.artifact }}-pass${{ matrix.pass }}
           path: dist/
           if-no-files-found: error
           retention-days: 1
 
-  build_pass2:
-    # Byte-identical mirror of build_pass1. The two jobs run in
-    # parallel on independent runners with the same container
-    # image; identical absolute pwd between passes is what makes
-    # the bit-compare robust against absolute-path leakage.
-    # If you change anything in the body, change it in build_pass1
-    # too.
-    name: Build artifacts (pass 2)
-    needs: test
-    runs-on: ubuntu-24.04
-    container:
-      image: ghcr.io/{{LOWERCASE_REPO}}/builder@sha256:{{BUILDER_DIGEST}}
-    defaults:
-      run:
-        shell: bash
-    timeout-minutes: 45
-    permissions:
-      contents: read
-
-    steps:
-      - name: Mark workspace safe for git (pre-checkout)
-        shell: sh
-        run: git config --global --add safe.directory '*'
-
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Derive version and SOURCE_DATE_EPOCH
-        id: meta
-        run: |
-          set -eu
-          SDE=$(git log -1 --format=%ct "${GITHUB_REF_NAME}")
-          ISO_TS=$(date -u -d "@${SDE}" '+%Y-%m-%dT%H:%M:%SZ')
-          {
-            echo "sde=${SDE}"
-            echo "iso_ts=${ISO_TS}"
-          } >> "$GITHUB_OUTPUT"
-          echo "SOURCE_DATE_EPOCH=${SDE}" >> "$GITHUB_ENV"
-
-      - name: Read project coordinates from pom
-        id: coords
-        run: |
-          set -eu
-          ARTIFACT_ID=$(mvn -o -B -q -DforceStdout help:evaluate -Dexpression=project.artifactId)
-          VERSION=$(mvn -o -B -q -DforceStdout help:evaluate -Dexpression=project.version)
-          {
-            echo "artifact_id=${ARTIFACT_ID}"
-            echo "version=${VERSION}"
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Build artifacts (offline, reproducible)
-        run: |
-          set -euo pipefail
-          mvn -o -B \
-              -Dproject.build.outputTimestamp="${{ steps.meta.outputs.iso_ts }}" \
-              -Dnotimestamp=true \
-              -DskipTests \
-              package source:jar javadoc:jar
-
-      - name: Stage release artifacts
-        env:
-          ARTIFACT_ID: ${{ steps.coords.outputs.artifact_id }}
-          VERSION: ${{ steps.coords.outputs.version }}
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-          cp "target/${ARTIFACT_ID}-${VERSION}.jar"          "dist/"
-          cp "target/${ARTIFACT_ID}-${VERSION}-sources.jar"  "dist/"
-          cp "target/${ARTIFACT_ID}-${VERSION}-javadoc.jar"  "dist/"
-          cp pom.xml "dist/${ARTIFACT_ID}-${VERSION}.pom"
-          if [ -f "target/${ARTIFACT_ID}-${VERSION}.module" ]; then
-            cp "target/${ARTIFACT_ID}-${VERSION}.module" "dist/"
-          fi
-
-      - name: Upload pass 2 artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: build-pass2
-          path: dist/
-          if-no-files-found: error
-          retention-days: 1
-
+  # Per-artifact verify: download the artifact's two passes, byte-
+  # compare, attest provenance, sign with cosign. Four jobs, one
+  # per file. needs: build waits for ALL eight build matrix entries
+  # to complete before any verify entry starts.
   verify:
-    name: Verify reproducibility, attest, sign
-    needs: [build_pass1, build_pass2]
+    name: Verify ${{ matrix.artifact }} (bit-compare + sign)
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        artifact: [jar, sources, javadoc, pom]
     runs-on: ubuntu-24.04
     container:
       image: ghcr.io/{{LOWERCASE_REPO}}/builder@sha256:{{BUILDER_DIGEST}}
@@ -340,32 +296,34 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: read
+      # Publish the SLSA attestation (out-of-band from artifacts).
       attestations: write
+      # Mint the short-lived OIDC token for keyless sigstore signing.
       id-token: write
 
     steps:
-      - name: Download pass 1 artifacts
+      - name: Download pass 1
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: build-pass1
+          name: build-${{ matrix.artifact }}-pass1
           path: pass1
 
-      - name: Download pass 2 artifacts
+      - name: Download pass 2
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: build-pass2
+          name: build-${{ matrix.artifact }}-pass2
           path: pass2
 
-      - name: Verify reproducibility
-        # File-set check first — the bit-compare loop iterates over
-        # pass1, so an extra/missing file in pass2 would otherwise
-        # slip past.
+      - name: Bit-compare passes
+        # File-set check first — a missing or extra file in either
+        # pass would otherwise slip past a per-file diff that
+        # iterates over only one side.
         run: |
           set -eu
           (cd pass1 && ls -1 | LC_ALL=C sort) > pass1.list
           (cd pass2 && ls -1 | LC_ALL=C sort) > pass2.list
           if ! diff -u pass1.list pass2.list; then
-            echo "FAIL: pass1 and pass2 emitted different file sets"
+            echo "FAIL: pass1 and pass2 emitted different file sets for ${{ matrix.artifact }}"
             exit 1
           fi
           echo "=== sha256 ==="
@@ -375,60 +333,60 @@ jobs:
             base=$(basename "$f")
             diff -q "pass1/${base}" "pass2/${base}"
           done
-          echo "Reproducibility verified: all artifacts byte-identical across passes."
+          echo "Bit-compare passed for ${{ matrix.artifact }}."
 
-      - name: Diagnose artifact differences
+      - name: Diagnose differences
         # Only fires on bit-compare failure. Helps an operator see
         # whether the divergence is in the manifest, in the class
         # files, in javadoc HTML, or in ZIP entry order — each of
         # those points at a different reproducibility knob.
         if: ${{ failure() }}
+        env:
+          ARTIFACT_TYPE: ${{ matrix.artifact }}
         run: |
           set -u
           mkdir -p diag
-          for f in pass1/*.jar; do
-            base=$(basename "$f")
-            stem="${base%.jar}"
-            echo "=== ${stem}: cmp ==="
-            cmp "pass1/${base}" "pass2/${base}" || true
-            echo "=== ${stem}: zip listing diff ==="
-            unzip -lqq "pass1/${base}" | LC_ALL=C sort > "diag/${stem}.p1.list" || true
-            unzip -lqq "pass2/${base}" | LC_ALL=C sort > "diag/${stem}.p2.list" || true
-            diff -u "diag/${stem}.p1.list" "diag/${stem}.p2.list" | head -60 || true
-            echo "=== ${stem}: MANIFEST.MF diff ==="
-            unzip -p "pass1/${base}" META-INF/MANIFEST.MF > "diag/${stem}.p1.mf" 2>/dev/null || true
-            unzip -p "pass2/${base}" META-INF/MANIFEST.MF > "diag/${stem}.p2.mf" 2>/dev/null || true
-            diff -u "diag/${stem}.p1.mf" "diag/${stem}.p2.mf" || true
-          done
-          for f in pass1/*.pom pass1/*.module; do
-            [ -f "$f" ] || continue
-            base=$(basename "$f")
-            echo "=== ${base}: diff ==="
-            diff -u "pass1/${base}" "pass2/${base}" | head -60 || true
-          done
+          case "${ARTIFACT_TYPE}" in
+            jar|sources|javadoc)
+              # ZIP-format artifacts: dump entry listing + manifest.
+              for f in pass1/*; do
+                base=$(basename "$f")
+                stem="${base%.jar}"
+                echo "=== ${stem}: cmp first differing byte ==="
+                cmp "pass1/${base}" "pass2/${base}" || true
+                echo "=== ${stem}: zip listing diff ==="
+                unzip -lqq "pass1/${base}" | LC_ALL=C sort > "diag/${stem}.p1.list" || true
+                unzip -lqq "pass2/${base}" | LC_ALL=C sort > "diag/${stem}.p2.list" || true
+                diff -u "diag/${stem}.p1.list" "diag/${stem}.p2.list" | head -60 || true
+                echo "=== ${stem}: MANIFEST.MF diff ==="
+                unzip -p "pass1/${base}" META-INF/MANIFEST.MF > "diag/${stem}.p1.mf" 2>/dev/null || true
+                unzip -p "pass2/${base}" META-INF/MANIFEST.MF > "diag/${stem}.p2.mf" 2>/dev/null || true
+                diff -u "diag/${stem}.p1.mf" "diag/${stem}.p2.mf" || true
+              done
+              ;;
+            pom)
+              # Plain XML — straight diff is enough.
+              for f in pass1/*; do
+                base=$(basename "$f")
+                echo "=== ${base}: diff ==="
+                diff -u "pass1/${base}" "pass2/${base}" | head -60 || true
+              done
+              ;;
+          esac
 
-      - name: Assemble release directory
+      - name: Stage release artifact
         # Sign pass1's bytes — identical to pass2 by the bit-
         # compare above, so the choice is arbitrary.
         run: |
           set -eu
           mkdir -p release
           cp pass1/* release/
-          cd release
-          ls -1 | LC_ALL=C sort | xargs sha256sum > SHA256SUMS
-          cat SHA256SUMS
+          ls -la release/
 
       - name: SLSA build provenance
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
-          # Glob covers jar / pom / module; SHA256SUMS is excluded
-          # because attest-build-provenance includes its own hash
-          # in the attestation, and SHA256SUMS lists those hashes
-          # itself — circular and unnecessary.
-          subject-path: |
-            release/*.jar
-            release/*.pom
-            release/*.module
+          subject-path: release/*
 
       - name: Install cosign
         # The builder image's apt set is derived from the Maven
@@ -446,24 +404,22 @@ jobs:
           echo "${COSIGN_SHA256}  /usr/local/bin/cosign" | sha256sum -c -
           chmod +x /usr/local/bin/cosign
 
-      - name: Sign each artifact with cosign
+      - name: Sign artifact with cosign
         env:
           COSIGN_YES: 'true'
         run: |
           set -euo pipefail
           for f in release/*; do
             [ -f "${f}" ] || continue
-            case "${f}" in
-              *.sigstore|release/SHA256SUMS) continue ;;
-            esac
+            case "${f}" in *.sigstore) continue ;; esac
             cosign sign-blob --bundle "${f}.sigstore" --new-bundle-format "${f}"
           done
           ls -la release/
 
-      - name: Upload verified artifacts
+      - name: Upload verified artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: release-artifacts
+          name: verified-${{ matrix.artifact }}
           path: release/
           if-no-files-found: error
           retention-days: 1
@@ -471,6 +427,9 @@ jobs:
   publish:
     name: Create draft release
     needs: verify
+    # `needs.verify.result` aggregates over all matrix entries:
+    # 'success' iff every entry succeeded. Any verify-side failure
+    # (bit-compare, signing, attestation) blocks publish.
     if: needs.verify.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -494,23 +453,42 @@ jobs:
             echo "iso_ts=${ISO_TS}"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Download verified artifacts
+      - name: Download all verified artifacts
+        # pattern: 'verified-*' pulls every per-artifact bundle
+        # the verify matrix uploaded; merge-multiple flattens them
+        # into release/ so all four files (plus their .sigstore
+        # bundles) live side-by-side for the release upload.
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: release-artifacts
+          pattern: verified-*
           path: release
+          merge-multiple: true
 
       - name: Determine release name
         id: name
-        # The release name is the tag stripped of common prefixes.
+        # Strip common tag prefixes for the GitHub release UI.
         # `rel/commons-lang-3.18.0` → `commons-lang-3.18.0`,
-        # `v1.2.3` → `1.2.3`. Used only in the GitHub release UI;
-        # artifact filenames are unaffected.
+        # `v1.2.3` → `1.2.3`. Artifact filenames are unaffected.
         run: |
           set -eu
           NAME="${GITHUB_REF_NAME#rel/}"
           NAME="${NAME#v}"
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Regenerate SHA256SUMS
+        # Now that all four artifacts are in release/, write a
+        # combined SHA256SUMS covering everything except sigstore
+        # bundles and the SHA256SUMS file itself.
+        run: |
+          set -euo pipefail
+          cd release
+          rm -f SHA256SUMS
+          ls -1 \
+            | grep -v '\.sigstore$' \
+            | grep -v '^SHA256SUMS$' \
+            | LC_ALL=C sort \
+            | xargs sha256sum > SHA256SUMS
+          cat SHA256SUMS
 
       - name: Build release notes
         env:
@@ -534,9 +512,10 @@ jobs:
             echo "## Release ${NAME}"
             echo
             echo "Produced by an automated GitHub Actions workflow from the"
-            echo "tagged commit. Every artifact is reproducible bit-for-bit"
-            echo "(verified by independent two-pass build) and signed by"
-            echo "the workflow's OIDC identity."
+            echo "tagged commit. Each artifact was built twice in independent"
+            echo "containers and byte-compared; every artifact ships with a"
+            echo "SLSA build provenance attestation and a cosign detached"
+            echo "signature."
             echo
             echo "**This release is currently a DRAFT.** The maintainer may"
             echo "optionally sign each artifact with their GPG key and"
