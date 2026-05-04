@@ -152,7 +152,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        artifact: [jar, sources, javadoc, pom]
+        artifact: [jar, sources, javadoc, pom, module]
         pass: [1, 2]
     runs-on: ubuntu-24.04
     container:
@@ -225,6 +225,17 @@ jobs:
         #             two passes producing identical bytes is a
         #             tautology, but the pair is here for the same
         #             audit evidence the others provide.
+        #   module  — Gradle Module Metadata, optional. Detected
+        #             by grep on pom.xml for the
+        #             gradle-module-metadata-maven-plugin
+        #             declaration. If absent (the common case for
+        #             Apache Commons projects and most Maven
+        #             projects), drop a `.no-module-published`
+        #             sentinel so the upload step has something to
+        #             upload; verify will see the sentinel on both
+        #             passes and skip cleanly. If declared but no
+        #             .module file is produced, fail loudly — the
+        #             plugin config is broken.
         env:
           ARTIFACT_TYPE: ${{ matrix.artifact }}
           ARTIFACT_ID: ${{ steps.coords.outputs.artifact_id }}
@@ -257,6 +268,28 @@ jobs:
             pom)
               cp pom.xml "dist/${ARTIFACT_ID}-${VERSION}.pom"
               ;;
+            module)
+              # Detect plugin via grep — plugin can appear in
+              # <plugins>, <pluginManagement>, or inherited from a
+              # parent pom (handled at mvn-resolve time, but the
+              # grep-on-pom heuristic catches the common cases).
+              if grep -qE '<artifactId>gradle-module-metadata-maven-plugin</artifactId>' pom.xml 2>/dev/null; then
+                echo "Project declares gradle-module-metadata-maven-plugin; building."
+                mvn -o -B \
+                    -Dproject.build.outputTimestamp="${ISO_TS}" \
+                    -DskipTests \
+                    package
+                if [ ! -f "target/${ARTIFACT_ID}-${VERSION}.module" ]; then
+                  echo "ERROR: gradle-module-metadata-maven-plugin declared but no .module produced." >&2
+                  echo "       Check plugin configuration (likely missing <execution> binding)." >&2
+                  exit 1
+                fi
+                cp "target/${ARTIFACT_ID}-${VERSION}.module" "dist/"
+              else
+                echo "Project does not declare gradle-module-metadata-maven-plugin — pair runs as no-op."
+                touch dist/.no-module-published
+              fi
+              ;;
             *)
               echo "ERROR: unknown matrix.artifact value: ${ARTIFACT_TYPE}" >&2
               exit 1
@@ -286,7 +319,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        artifact: [jar, sources, javadoc, pom]
+        artifact: [jar, sources, javadoc, pom, module]
     runs-on: ubuntu-24.04
     container:
       image: ghcr.io/{{LOWERCASE_REPO}}/builder@sha256:{{BUILDER_DIGEST}}
@@ -314,7 +347,31 @@ jobs:
           name: build-${{ matrix.artifact }}-pass2
           path: pass2
 
+      - name: Detect no-op (module pair when project doesn't publish)
+        # Only relevant for the `module` matrix entry: the build
+        # job dropped a sentinel file when the project doesn't
+        # declare gradle-module-metadata-maven-plugin. If both
+        # passes uploaded only the sentinel, this verify entry
+        # is a no-op and subsequent steps skip via the output.
+        # For non-module matrix entries the step's `if:` is false,
+        # so it doesn't run; downstream gates use `!= 'true'`
+        # which evaluates true for the empty (unset) output, so
+        # those entries proceed normally.
+        id: skip
+        if: matrix.artifact == 'module'
+        run: |
+          set -eu
+          if [ -f pass1/.no-module-published ] && [ -f pass2/.no-module-published ]; then
+            echo "Project does not publish .module — verify is a no-op."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          elif [ -f pass1/.no-module-published ] || [ -f pass2/.no-module-published ]; then
+            echo "FAIL: one pass published .module, the other didn't." >&2
+            ls -la pass1/ pass2/ >&2
+            exit 1
+          fi
+
       - name: Bit-compare passes
+        if: steps.skip.outputs.skip != 'true'
         # File-set check first — a missing or extra file in either
         # pass would otherwise slip past a per-file diff that
         # iterates over only one side.
@@ -340,25 +397,30 @@ jobs:
         # whether the divergence is in the manifest, in the class
         # files, in javadoc HTML, or in ZIP entry order — each of
         # those points at a different reproducibility knob.
-        if: ${{ failure() }}
+        if: ${{ failure() && steps.skip.outputs.skip != 'true' }}
         env:
           ARTIFACT_TYPE: ${{ matrix.artifact }}
         run: |
           set -u
           mkdir -p diag
           case "${ARTIFACT_TYPE}" in
-            jar|sources|javadoc)
-              # ZIP-format artifacts: dump entry listing + manifest.
+            jar|sources|javadoc|module)
+              # ZIP-format artifacts (.module is JSON inside a
+              # plain text file, but it's small — fall through to
+              # the binary-aware diagnostic to keep one branch).
               for f in pass1/*; do
                 base=$(basename "$f")
                 stem="${base%.jar}"
                 echo "=== ${stem}: cmp first differing byte ==="
                 cmp "pass1/${base}" "pass2/${base}" || true
-                echo "=== ${stem}: zip listing diff ==="
-                unzip -lqq "pass1/${base}" | LC_ALL=C sort > "diag/${stem}.p1.list" || true
-                unzip -lqq "pass2/${base}" | LC_ALL=C sort > "diag/${stem}.p2.list" || true
+                # zip listing only meaningful for jars; .module
+                # isn't a zip and `unzip -l` will exit non-zero —
+                # tolerate.
+                echo "=== ${stem}: zip listing diff (skipped if not a zip) ==="
+                unzip -lqq "pass1/${base}" 2>/dev/null | LC_ALL=C sort > "diag/${stem}.p1.list" || true
+                unzip -lqq "pass2/${base}" 2>/dev/null | LC_ALL=C sort > "diag/${stem}.p2.list" || true
                 diff -u "diag/${stem}.p1.list" "diag/${stem}.p2.list" | head -60 || true
-                echo "=== ${stem}: MANIFEST.MF diff ==="
+                echo "=== ${stem}: MANIFEST.MF diff (jars only) ==="
                 unzip -p "pass1/${base}" META-INF/MANIFEST.MF > "diag/${stem}.p1.mf" 2>/dev/null || true
                 unzip -p "pass2/${base}" META-INF/MANIFEST.MF > "diag/${stem}.p2.mf" 2>/dev/null || true
                 diff -u "diag/${stem}.p1.mf" "diag/${stem}.p2.mf" || true
@@ -377,6 +439,7 @@ jobs:
       - name: Stage release artifact
         # Sign pass1's bytes — identical to pass2 by the bit-
         # compare above, so the choice is arbitrary.
+        if: steps.skip.outputs.skip != 'true'
         run: |
           set -eu
           mkdir -p release
@@ -384,6 +447,7 @@ jobs:
           ls -la release/
 
       - name: SLSA build provenance
+        if: steps.skip.outputs.skip != 'true'
         uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
         with:
           subject-path: release/*
@@ -394,6 +458,7 @@ jobs:
         # the GitHub releases endpoint with SHA256 verification.
         # Same version as build-container.yml so the signing tool
         # is pinned consistently across the pipeline.
+        if: steps.skip.outputs.skip != 'true'
         run: |
           set -euo pipefail
           COSIGN_VERSION=v3.0.6
@@ -405,6 +470,7 @@ jobs:
           chmod +x /usr/local/bin/cosign
 
       - name: Sign artifact with cosign
+        if: steps.skip.outputs.skip != 'true'
         env:
           COSIGN_YES: 'true'
         run: |
@@ -417,6 +483,7 @@ jobs:
           ls -la release/
 
       - name: Upload verified artifact
+        if: steps.skip.outputs.skip != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: verified-${{ matrix.artifact }}
