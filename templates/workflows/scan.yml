@@ -834,18 +834,18 @@ jobs:
             exit 0
           fi
 
-          # [skip ci] in the subject suppresses push-triggered
-          # workflows on the auto-commit. Without it, every
-          # Dockerfile regen retriggers the full set of upstream
-          # PR checks on the topic branch (Java CI matrix +
-          # dependency-review + CodeQL etc.), which adds 20-30
-          # min of CI runtime and a wall of red/green that has
-          # no useful signal — the Dockerfile change touches
-          # nothing those workflows care about. The explicit
-          # workflow_dispatch of build-container.yml below still
-          # fires (dispatches aren't suppressed by skip-ci).
+          # No [skip ci] marker. GitHub's skip-ci semantics
+          # suppress workflows on BOTH push AND pull_request
+          # events for the marked commit — using it on the auto-
+          # commit silences the Dockerfile-regen push (good)
+          # but also silences pull_request checks against this
+          # commit as a head (bad: adopters lose the project's
+          # own CI signal on the slsa-maven PR). The trade-off
+          # came out the wrong way; better to let upstream
+          # workflows re-run on each regen than to mask the
+          # project's PR-time test signal.
           git commit \
-            -m 'Regenerate Dockerfile via slsa-maven scan [skip ci]' \
+            -m 'Regenerate Dockerfile via slsa-maven scan' \
             -m "Apt mirror: ${APT_MIRROR_URL}" \
             -m "Snapshot timestamp: ${SNAPSHOT_TS}" \
             -m 'Every apt and Maven byte verified by SHA256.'
