@@ -443,6 +443,23 @@ jobs:
             jq
           git config --global --add safe.directory "${GITHUB_WORKSPACE}"
 
+          # JAVA_HOME for the rest of this job AND for the emitted
+          # Dockerfile. apt's openjdk-${MAJOR}-jdk lays out at
+          # /usr/lib/jvm/java-${MAJOR}-openjdk-amd64. mvn finds its
+          # own JDK fine without this, but maven-javadoc-plugin
+          # shells out to `javadoc` and looks specifically at
+          # JAVA_HOME — without it, every javadoc:jar invocation
+          # fails with "JAVA_HOME is not correctly set". Some apt-
+          # installed JDKs don't export it system-wide.
+          JAVA_HOME="/usr/lib/jvm/java-${JDK_MAJOR}-openjdk-amd64"
+          if [ ! -x "${JAVA_HOME}/bin/javadoc" ]; then
+            echo "ERROR: expected javadoc at ${JAVA_HOME}/bin/javadoc, not found" >&2
+            ls -la /usr/lib/jvm/ >&2 || true
+            exit 1
+          fi
+          echo "JAVA_HOME=${JAVA_HOME}" >> "$GITHUB_ENV"
+          echo "JAVA_HOME pinned to ${JAVA_HOME} for the rest of this job and the emitted Dockerfile."
+
       - name: Install Maven from archive.apache.org
         # SHA512-pinned download. Apache's archive is content-
         # addressable + immutable like Maven Central, so the SHA
@@ -719,6 +736,11 @@ jobs:
             echo "FROM ubuntu@${IMAGE_DIGEST}"
             echo ""
             echo "ENV DEBIAN_FRONTEND=noninteractive"
+            # JAVA_HOME baked in so maven-javadoc-plugin can shell
+            # out to javadoc at release time — apt's openjdk-N-jdk
+            # lays out at /usr/lib/jvm/java-N-openjdk-amd64 but
+            # doesn't export JAVA_HOME system-wide.
+            echo "ENV JAVA_HOME=${JAVA_HOME}"
             echo ""
             echo "# Step 1: bootstrap ca-certificates so we can reach"
             echo "# the apt mirror over HTTPS."
