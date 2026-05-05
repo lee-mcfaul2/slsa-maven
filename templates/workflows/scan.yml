@@ -440,7 +440,8 @@ jobs:
             unzip \
             tar \
             libxml2-utils \
-            jq
+            jq \
+            libicu74
           git config --global --add safe.directory "${GITHUB_WORKSPACE}"
 
           # JAVA_HOME for the rest of this job AND for the emitted
