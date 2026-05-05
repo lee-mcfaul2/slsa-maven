@@ -285,7 +285,13 @@ jobs:
     defaults:
       run:
         shell: bash
-    timeout-minutes: 75
+    # 180 min, not 75. Large reactors (keycloak: 143-module
+    # default reactor with frontend builds + per-module javadoc)
+    # routinely take ≥75 min for the strace step alone, before
+    # the m2 walk + Dockerfile emit. GHA hard-caps individual
+    # jobs at 360 min so 180 leaves real margin. Smaller projects
+    # complete much sooner — the cap only matters for slow ones.
+    timeout-minutes: 180
     permissions:
       # Push the emitted Dockerfile back to this branch.
       contents: write
