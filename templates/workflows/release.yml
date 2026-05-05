@@ -3,12 +3,16 @@
 #
 # Reproducible release workflow for a Maven project.
 #
-# Triggered by pushing a tag. Produces the four standard Maven
+# Triggered by pushing a tag. Produces up to five standard Maven
 # release artifacts:
 #   - <artifactId>-<version>.jar
 #   - <artifactId>-<version>-sources.jar
 #   - <artifactId>-<version>-javadoc.jar
 #   - <artifactId>-<version>.pom
+#   - <artifactId>-<version>.module    (only if the project
+#                                       declares the
+#                                       gradle-module-metadata-
+#                                       maven-plugin)
 #
 # Each artifact is built TWICE in independent containers — one
 # pair per file — and the two passes are byte-compared. Each
@@ -24,13 +28,20 @@
 #     ├─ build (jar,     pass=2) ─┤  → verify (jar)     ─┐
 #     ├─ build (sources, pass=1) ─┤                      │
 #     ├─ build (sources, pass=2) ─┤  → verify (sources) ─┤
-#     ├─ build (javadoc, pass=1) ─┤                      ├─ publish
-#     ├─ build (javadoc, pass=2) ─┤  → verify (javadoc) ─┤
+#     ├─ build (javadoc, pass=1) ─┤                      │
+#     ├─ build (javadoc, pass=2) ─┤  → verify (javadoc) ─├─ publish
 #     ├─ build (pom,     pass=1) ─┤                      │
-#     └─ build (pom,     pass=2) ─┘  → verify (pom)     ─┘
+#     ├─ build (pom,     pass=2) ─┤  → verify (pom)     ─┤
+#     ├─ build (module,  pass=1) ─┤                      │
+#     └─ build (module,  pass=2) ─┘  → verify (module)  ─┘
 #
-# 1 + 8 + 4 + 1 = 14 jobs. The 8 build jobs and 4 verify jobs are
-# each one matrix-spec, not 12 copy-pasted definitions.
+# 1 + 10 + 5 + 1 = 17 jobs. The 10 build jobs and 5 verify jobs
+# come from one matrix-spec each (not 15 copy-pasted definitions).
+# When the project doesn't publish .module, both module passes
+# upload only a sentinel `MODULE-NOT-PUBLISHED` file and the
+# corresponding verify entry skips bit-compare/attest/sign — net
+# behavior: the matrix entry is a clean no-op and produces no
+# release artifact.
 #
 # Why one pair per file? Per-artifact isolation. A flaky javadoc
 # generation can't taint the jar bit-compare. Each artifact gets
@@ -230,7 +241,7 @@ jobs:
         #             gradle-module-metadata-maven-plugin
         #             declaration. If absent (the common case for
         #             Apache Commons projects and most Maven
-        #             projects), drop a `.no-module-published`
+        #             projects), drop a `MODULE-NOT-PUBLISHED`
         #             sentinel so the upload step has something to
         #             upload; verify will see the sentinel on both
         #             passes and skip cleanly. If declared but no
@@ -287,7 +298,7 @@ jobs:
                 cp "target/${ARTIFACT_ID}-${VERSION}.module" "dist/"
               else
                 echo "Project does not declare gradle-module-metadata-maven-plugin — pair runs as no-op."
-                touch dist/.no-module-published
+                touch dist/MODULE-NOT-PUBLISHED
               fi
               ;;
             *)
@@ -361,10 +372,10 @@ jobs:
         if: matrix.artifact == 'module'
         run: |
           set -eu
-          if [ -f pass1/.no-module-published ] && [ -f pass2/.no-module-published ]; then
+          if [ -f pass1/MODULE-NOT-PUBLISHED ] && [ -f pass2/MODULE-NOT-PUBLISHED ]; then
             echo "Project does not publish .module — verify is a no-op."
             echo "skip=true" >> "$GITHUB_OUTPUT"
-          elif [ -f pass1/.no-module-published ] || [ -f pass2/.no-module-published ]; then
+          elif [ -f pass1/MODULE-NOT-PUBLISHED ] || [ -f pass2/MODULE-NOT-PUBLISHED ]; then
             echo "FAIL: one pass published .module, the other didn't." >&2
             ls -la pass1/ pass2/ >&2
             exit 1
