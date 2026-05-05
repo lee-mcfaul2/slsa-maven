@@ -143,12 +143,17 @@ for pom in downloads/*.pom; do
   mkdir -p "${dest}"
 
   # Copy pom + every artifact whose name starts with the
-  # ${artifactId}-${version} prefix (catches jar, -sources.jar,
-  # -javadoc.jar, .module, etc.).
+  # ${artifactId}-${version} prefix. Catches jar, -sources.jar,
+  # -javadoc.jar, .module, AND each artifact's .sigstore bundle
+  # (cosign sidecar). Central accepts any sidecar file alongside
+  # the standard Maven artifacts; uploading the .sigstore bundles
+  # alongside the .asc gives consumers who know to look the
+  # cosign-verifiable bytes-integrity proof from the same URL as
+  # the GPG-verifiable maintainer-approval proof.
   cp "${pom}" "${dest}/"
   for sib in downloads/${expected_base}*; do
     [ -f "${sib}" ] || continue
-    case "${sib}" in *.pom|*.sigstore) continue ;; esac
+    case "${sib}" in *.pom) continue ;; esac
     cp "${sib}" "${dest}/"
   done
 
