@@ -389,33 +389,42 @@ jobs:
         #          tautology, but the pair is here for the same
         #          audit evidence the others provide.
         #   jar / maven-plugin —
-        #     1. `mvn -pl X -am install -DskipTests` (or, for the
-        #        reactor root, just `mvn install -DskipTests`)
-        #        builds the focal module + its in-reactor
-        #        dependency chain and lands the jars in the local
-        #        repo. `install` (not `package`) so subsequent
-        #        -pl X without -am can resolve dep jars from the
-        #        local repo. -DskipTests because the test job
-        #        already ran the full reactor verify; running
-        #        tests again per matrix entry would multiply
-        #        wall-time by N modules.
-        #     2. `mvn -pl X source:jar` produces the sources jar.
-        #        source:jar is a standalone goal, doesn't require
-        #        compile. -am not needed: deps are already in
-        #        local repo from step 1.
-        #     3. `mvn -pl X javadoc:jar` produces the javadoc jar.
-        #        Requires compiled classes, which step 1 produced.
-        #        -Dnotimestamp=true suppresses the dc.created
-        #        HTML <meta> stamp.
-        #     4. Copy the four target/ outputs + the source pom.xml
-        #        into dist/.
-        #     5. Module file: if the project declares the
-        #        gradle-module-metadata-maven-plugin, the install
-        #        step in (1) produces target/<artifact>-<v>.module;
-        #        copy it. Otherwise drop a per-module-prefixed
-        #        sentinel file so verify can detect "no .module
-        #        published" without filename collisions across
-        #        modules in the publish merge.
+        #     One mvn invocation, three goals:
+        #       mvn -o -pl X -am package source:jar javadoc:jar
+        #     -pl X -am builds the reduced reactor (X plus its
+        #     in-reactor dependency chain). Each goal runs against
+        #     every project in that reduced reactor, so source/
+        #     javadoc jars are produced for X's deps too — those
+        #     just sit in their own target/ dirs and we ignore
+        #     them; we only collect X's outputs into dist/.
+        #
+        #     Why not `install`? scan.yml's BUILD_CMD doesn't pull
+        #     maven-install-plugin into the offline cache (verify
+        #     phase doesn't bind install:install), so `mvn -o
+        #     install` would fail on the offline image. `-am` is
+        #     enough — it builds in-reactor deps in place, and
+        #     mvn's reactor resolution finds them by their target/
+        #     classes without needing them installed to the local
+        #     m2 repo.
+        #
+        #     -DskipTests because the test job already ran the
+        #     full reactor verify; running tests again per matrix
+        #     entry would multiply wall-time by N modules.
+        #
+        #     -Dnotimestamp=true suppresses the dc.created HTML
+        #     <meta> stamp on javadoc HTML files.
+        #
+        #     For the reactor root (mvn_path = "."), no -pl flag —
+        #     mvn at the root processes the whole reactor in
+        #     topological order; the root IS the focal module.
+        #
+        #     Module file: if the project declares the
+        #     gradle-module-metadata-maven-plugin, the package
+        #     step produces target/<artifact>-<v>.module; copy
+        #     it. Otherwise drop a per-module-prefixed sentinel
+        #     file so verify can detect "no .module published"
+        #     without filename collisions across modules in the
+        #     publish merge.
         env:
           MVN_PATH: ${{ matrix.mvn_path }}
           ARTIFACT_ID: ${{ matrix.artifact_id }}
@@ -427,12 +436,8 @@ jobs:
           mkdir -p dist
 
           # -pl/-am only meaningful inside a reactor with multiple
-          # modules. For a root-level build (mvn_path = "."),
-          # -pl . -am collapses to the root project alone and would
-          # break in-reactor deps for downstream callers — but at
-          # root, "the reactor" IS the focal module, so just run
-          # without -pl. mvn at the reactor root processes the
-          # whole reactor in topological order.
+          # modules. For a root-level build (mvn_path = "."), no
+          # -pl flag is needed — mvn processes the whole reactor.
           PL_FLAGS=()
           target_dir="target"
           pom_path="pom.xml"
@@ -444,42 +449,26 @@ jobs:
 
           case "$PACKAGING" in
             jar|maven-plugin)
-              # Step 1: install focal + in-reactor deps to local repo.
+              # All three goals in one invocation. -am brings in
+              # in-reactor deps (built in place, not installed).
               mvn -o -B \
                   "${PL_FLAGS[@]}" \
                   -DskipTests \
                   -Dproject.build.outputTimestamp="$ISO_TS" \
-                  install
-
-              # Steps 2 & 3 use -pl X without -am — deps now
-              # resolvable from local repo. For root reactor, no
-              # -pl; mvn picks up the only project.
-              if [ "$MVN_PATH" = "." ]; then
-                pl_only=()
-              else
-                pl_only=(-pl "$MVN_PATH")
-              fi
-
-              # Step 2: source jar.
-              mvn -o -B \
-                  "${pl_only[@]}" \
-                  -Dproject.build.outputTimestamp="$ISO_TS" \
-                  source:jar
-
-              # Step 3: javadoc jar.
-              mvn -o -B \
-                  "${pl_only[@]}" \
-                  -Dproject.build.outputTimestamp="$ISO_TS" \
                   -Dnotimestamp=true \
-                  javadoc:jar
+                  package source:jar javadoc:jar
 
-              # Step 4: collect.
+              # Collect X's outputs only; sources/javadoc jars
+              # produced for X's in-reactor deps stay in their
+              # own target/ dirs and are ignored.
               cp "$target_dir/$ARTIFACT_ID-$VERSION.jar"         "dist/"
               cp "$target_dir/$ARTIFACT_ID-$VERSION-sources.jar" "dist/"
               cp "$target_dir/$ARTIFACT_ID-$VERSION-javadoc.jar" "dist/"
               cp "$pom_path"                                      "dist/$ARTIFACT_ID-$VERSION.pom"
 
-              # Step 5: module file.
+              # Module file (Gradle Module Metadata): if the
+              # project declares the plugin, the package phase
+              # already produced target/<artifact>-<v>.module.
               if grep -qE '<artifactId>gradle-module-metadata-maven-plugin</artifactId>' "$pom_path" 2>/dev/null; then
                 if [ ! -f "$target_dir/$ARTIFACT_ID-$VERSION.module" ]; then
                   echo "ERROR: gradle-module-metadata-maven-plugin declared but no .module produced." >&2
