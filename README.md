@@ -221,6 +221,61 @@ pins — they gate a profile if the JDK is N+, but don't require
 it. Treating them as pins would force adopters onto unnecessary
 JDK versions.
 
+## Publishing to Maven Central
+
+slsa-maven CI never has a GPG private key or a Maven Central
+token. Publishing to Central is a separate maintainer-side step
+that runs on the maintainer's own machine, where both secrets
+live and never leave.
+
+The flow:
+
+1. Tag push fires `release.yml`. Output: a draft GitHub release
+   with byte-reproducible `jar` / `sources.jar` / `javadoc.jar` /
+   `pom` (per artifact, two passes byte-compared), each with its
+   own SLSA build provenance attestation and cosign sigstore
+   signature. **No GPG. No Central credentials.**
+2. Maintainer reviews the draft release on GitHub.
+3. Maintainer runs `scripts/publish-to-central` locally:
+
+   ```
+   CENTRAL_TOKEN=<bearer-from-central-portal-ui> \
+   ./scripts/publish-to-central <owner>/<repo> <tag>
+   ```
+
+   The script `gh release download`s the artifacts, GPG-signs
+   each (using the maintainer's default key), generates the
+   md5/sha1 sidecars Central expects, packages the Sonatype
+   Central upload bundle in standard Maven repo layout, and
+   POSTs to the Central Portal API.
+4. Central validates and (depending on `PUBLISHING_TYPE`) either
+   stages for manual approval or auto-publishes.
+
+Two trust boundaries, both intact:
+
+- **Bytes integrity** — the cosign + SLSA + bit-compare property
+  is established by CI before the maintainer touches anything.
+  Anyone in the world can verify the bytes against the workflow
+  identity without needing the maintainer's GPG key.
+- **Maintainer approval** — the GPG signature attests that this
+  specific human approved this specific release. Same evidence
+  the traditional flow provides, just with the key staying on
+  the maintainer's machine instead of in a CI secret.
+
+Token: generate from
+<https://central.sonatype.com/account> → "Generate User Token".
+Either pass `CENTRAL_TOKEN` (pre-encoded base64 of
+`username:password`) or `CENTRAL_USERNAME` + `CENTRAL_PASSWORD`
+and the script encodes for you.
+
+Defaults: `PUBLISHING_TYPE=USER_MANAGED` (sit in Central staging
+until you click Publish in the Portal UI). Set
+`PUBLISHING_TYPE=AUTOMATIC` to skip the staging step.
+
+Custom GPG setups (subkey-only releases, smartcard readers,
+non-default keys) — set `GPG_KEY_ID=<keyid>`, or just open the
+script and adapt; it's bash and ~200 lines.
+
 ## Status
 
 Work in progress.

@@ -1,0 +1,213 @@
+#!/usr/bin/env bash
+#
+# slsa-maven / publish-to-central
+#
+# Maintainer-side companion to the slsa-maven release pipeline.
+# Downloads a draft GitHub release that release.yml produced,
+# GPG-signs each artifact with the maintainer's default key,
+# packages the Sonatype Central upload bundle, and POSTs it.
+#
+# This is the "human approval + Central distribution" half of
+# the trust model. slsa-maven (CI) produces the byte-reproducible
+# artifacts + cosign sigs + SLSA attestations on a draft GitHub
+# release without any maintainer credentials. This script then
+# runs locally on the maintainer's machine where the GPG private
+# key and Central token both live and never leave.
+#
+# Usage:
+#   CENTRAL_TOKEN=<bearer>             ./publish-to-central <owner>/<repo> <tag>
+# OR:
+#   CENTRAL_USERNAME=...                ./publish-to-central <owner>/<repo> <tag>
+#   CENTRAL_PASSWORD=...
+#
+# Optional env:
+#   PUBLISHING_TYPE=AUTOMATIC|USER_MANAGED   (default USER_MANAGED:
+#                                             sit in Central staging
+#                                             until the maintainer
+#                                             clicks Publish in the UI.
+#                                             AUTOMATIC publishes
+#                                             immediately after
+#                                             Central's validation.)
+#   GPG_KEY_ID=<keyid>                  Override default signing key.
+#                                       If unset, GPG uses default-key
+#                                       from gpg.conf or first
+#                                       available secret key.
+#
+# Requirements:
+#   - gh CLI, authenticated against the GitHub repo
+#   - gpg with at least one secret key importable (default flow);
+#     custom setups should supply GPG_KEY_ID or modify this script
+#   - curl, zip, sha1sum, md5sum, awk
+#
+# Token: generate from https://central.sonatype.com/account ->
+#        "Generate User Token". You get a username + password pair;
+#        the Bearer token is base64("$username:$password").
+
+set -euo pipefail
+
+log()  { printf '==> %s\n' "$*" >&2; }
+warn() { printf '!!  %s\n' "$*" >&2; }
+die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+# --- args + env ----------------------------------------------------
+
+[ $# -eq 2 ] || die "usage: $0 <owner>/<repo> <tag>"
+OWNER_REPO="$1"
+TAG="$2"
+
+if [ -n "${CENTRAL_TOKEN:-}" ]; then
+  BEARER="${CENTRAL_TOKEN}"
+elif [ -n "${CENTRAL_USERNAME:-}" ] && [ -n "${CENTRAL_PASSWORD:-}" ]; then
+  BEARER=$(printf '%s:%s' "${CENTRAL_USERNAME}" "${CENTRAL_PASSWORD}" \
+           | base64 -w 0)
+else
+  die "Set CENTRAL_TOKEN, or both CENTRAL_USERNAME and CENTRAL_PASSWORD"
+fi
+
+PUBLISHING_TYPE="${PUBLISHING_TYPE:-USER_MANAGED}"
+case "${PUBLISHING_TYPE}" in
+  USER_MANAGED|AUTOMATIC) ;;
+  *) die "PUBLISHING_TYPE must be USER_MANAGED or AUTOMATIC (got: ${PUBLISHING_TYPE})" ;;
+esac
+
+for tool in gh gpg curl zip sha1sum md5sum awk base64; do
+  command -v "$tool" >/dev/null || die "$tool not found in PATH"
+done
+
+# --- sanity: GPG must have a secret key available ------------------
+
+if [ -n "${GPG_KEY_ID:-}" ]; then
+  gpg --list-secret-keys "${GPG_KEY_ID}" >/dev/null 2>&1 \
+    || die "GPG_KEY_ID=${GPG_KEY_ID} not in keyring"
+  GPG_OPTS=(--local-user "${GPG_KEY_ID}")
+else
+  if ! gpg --list-secret-keys 2>/dev/null | grep -q '^sec'; then
+    die "No GPG secret key available. Either import one, or set GPG_KEY_ID."
+  fi
+  GPG_OPTS=()
+fi
+
+# --- workspace -----------------------------------------------------
+
+WORK=$(mktemp -d)
+trap 'rm -rf "${WORK}"' EXIT
+cd "${WORK}"
+
+log "Workspace: ${WORK}"
+log "Repo: ${OWNER_REPO}    Tag: ${TAG}"
+log "Publishing type: ${PUBLISHING_TYPE}"
+
+# --- 1. download draft release artifacts ---------------------------
+
+mkdir downloads
+log "Downloading release artifacts from gh..."
+gh release download "${TAG}" --repo "${OWNER_REPO}" --dir downloads
+
+# Filter out artifacts not destined for Central — sigstore bundles
+# (cosign-side proof, no Central role) and SHA256SUMS.
+shopt -s nullglob
+artifacts=()
+for f in downloads/*; do
+  case "${f}" in
+    *.sigstore|downloads/SHA256SUMS) continue ;;
+  esac
+  artifacts+=("${f}")
+done
+[ ${#artifacts[@]} -gt 0 ] || die "no Central-relevant artifacts in the release"
+log "Found ${#artifacts[@]} artifacts to publish."
+
+# --- 2. assemble Maven repo layout in bundle/ ----------------------
+
+mkdir bundle
+
+# Drive layout from the pom files. Each pom names a (groupId,
+# artifactId, version) triple; sidecar artifacts (jar, sources,
+# javadoc, module) follow the artifactId-version-... naming convention
+# next to the pom in the release dir.
+for pom in downloads/*.pom; do
+  [ -f "${pom}" ] || continue
+  base=$(basename "${pom}" .pom)
+
+  groupId=$(awk -F'[<>]' '/<groupId>/{print $3; exit}' "${pom}" | tr -d ' \t')
+  artifactId=$(awk -F'[<>]' '/<artifactId>/{print $3; exit}' "${pom}" | tr -d ' \t')
+  version=$(awk -F'[<>]' '/<version>/{print $3; exit}' "${pom}" | tr -d ' \t')
+  [ -n "${groupId}" ] && [ -n "${artifactId}" ] && [ -n "${version}" ] \
+    || die "could not parse groupId/artifactId/version from ${pom}"
+
+  expected_base="${artifactId}-${version}"
+  [ "${base}" = "${expected_base}" ] \
+    || warn "pom basename ${base} doesn't match ${expected_base}; continuing"
+
+  group_path=$(echo "${groupId}" | tr '.' '/')
+  dest="bundle/${group_path}/${artifactId}/${version}"
+  mkdir -p "${dest}"
+
+  # Copy pom + every artifact whose name starts with the
+  # ${artifactId}-${version} prefix (catches jar, -sources.jar,
+  # -javadoc.jar, .module, etc.).
+  cp "${pom}" "${dest}/"
+  for sib in downloads/${expected_base}*; do
+    [ -f "${sib}" ] || continue
+    case "${sib}" in *.pom|*.sigstore) continue ;; esac
+    cp "${sib}" "${dest}/"
+  done
+
+  log "  ${groupId}:${artifactId}:${version}"
+done
+
+# --- 3. GPG-sign + checksum sidecars -------------------------------
+
+log "GPG-signing artifacts (will prompt for passphrase if needed)..."
+find bundle -type f \! \( -name '*.asc' -o -name '*.md5' -o -name '*.sha1' \) \
+  | while read -r f; do
+      gpg --batch --yes --detach-sign --armor "${GPG_OPTS[@]}" "${f}"
+      md5sum  "${f}" | awk '{print $1}' > "${f}.md5"
+      sha1sum "${f}" | awk '{print $1}' > "${f}.sha1"
+    done
+
+# --- 4. zip + upload -----------------------------------------------
+
+cd bundle
+zip -qr ../bundle.zip .
+cd ..
+SIZE=$(wc -c < bundle.zip | awk '{print $1}')
+log "Bundle: bundle.zip (${SIZE} bytes)"
+
+DEPLOYMENT_NAME=$(printf '%s-%s' "${TAG}" "$(date +%s)" | tr -c 'A-Za-z0-9.-' '-')
+URL="https://central.sonatype.com/api/v1/publisher/upload?name=${DEPLOYMENT_NAME}&publishingType=${PUBLISHING_TYPE}"
+
+log "POSTing to ${URL}"
+http=$(curl -sS -o /tmp/sonatype.out -w '%{http_code}' \
+  -X POST \
+  -H "Authorization: Bearer ${BEARER}" \
+  -F "bundle=@bundle.zip" \
+  "${URL}")
+
+case "${http}" in
+  201)
+    DEPLOYMENT_ID=$(cat /tmp/sonatype.out)
+    log "Upload accepted. Deployment ID: ${DEPLOYMENT_ID}"
+    cat <<EOF
+
+Track + approve at:
+  https://central.sonatype.com/publishing/deployments
+
+Status (programmatic):
+  curl -H "Authorization: Bearer \${CENTRAL_TOKEN}" \\
+    "https://central.sonatype.com/api/v1/publisher/status?id=${DEPLOYMENT_ID}"
+
+EOF
+    [ "${PUBLISHING_TYPE}" = "USER_MANAGED" ] \
+      && echo "PUBLISHING_TYPE=USER_MANAGED — review and click Publish in the UI."
+    [ "${PUBLISHING_TYPE}" = "AUTOMATIC" ] \
+      && echo "PUBLISHING_TYPE=AUTOMATIC — Central will publish after its own validation passes."
+    ;;
+  401|403)
+    die "Auth failed (HTTP ${http}). Check CENTRAL_TOKEN / CENTRAL_USERNAME+PASSWORD."
+    ;;
+  *)
+    echo "Sonatype Central response: HTTP ${http}" >&2
+    cat /tmp/sonatype.out >&2 || true
+    die "upload failed"
+    ;;
+esac
