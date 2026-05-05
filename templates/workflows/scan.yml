@@ -91,7 +91,14 @@ jobs:
   resolve:
     name: Resolve target Ubuntu base and JDK from pom.xml
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    # 30 min, not 10. The apt-get update + install step uses
+    # GitHub's default ubuntu archive mirror, which periodically
+    # rate-limits or runs slow when many concurrent runners on the
+    # same fork hit it (e.g. when the target repo has its own busy
+    # CI suite firing on the same push). Hitting the timeout
+    # cancels the whole workflow run; 30 min absorbs realistic
+    # transient slowness without masking a real hang.
+    timeout-minutes: 30
     permissions:
       contents: read
     outputs:
@@ -106,11 +113,34 @@ jobs:
           persist-credentials: false
 
       - name: Install resolver tools
+        # Retry pattern matching the scan job's apt installs — when
+        # archive.ubuntu.com is throttling or just slow under
+        # concurrent-runner pressure, the first attempt can stall
+        # past several minutes. 6 attempts × exponential backoff
+        # gives ~63 min worst-case but each attempt is fast on a
+        # warm mirror. Acquire timeout = 30s caps individual fetch
+        # stalls so retries can take over.
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            libxml2-utils
+          for attempt in 1 2 3 4 5 6; do
+            sudo apt-get -o Acquire::http::Timeout=30 \
+                         -o Acquire::Retries=3 \
+                         update -qq 2>&1 | tee /tmp/apt-update.log
+            if [ "${PIPESTATUS[0]}" = "0" ] && ! grep -q 'Failed to fetch' /tmp/apt-update.log; then
+              break
+            fi
+            if [ "${attempt}" = "6" ]; then
+              echo "ERROR: apt-get update kept failing across 6 attempts" >&2
+              exit 1
+            fi
+            backoff=$((30 * attempt))
+            echo "apt-get update attempt ${attempt} slow/failed; sleeping ${backoff}s" >&2
+            sleep "${backoff}"
+          done
+          sudo apt-get -o Acquire::http::Timeout=30 \
+                       -o Acquire::Retries=3 \
+                       install -y --no-install-recommends \
+                       libxml2-utils
 
       - name: Pick JDK and base release from pom.xml
         id: pick
