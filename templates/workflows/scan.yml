@@ -408,7 +408,9 @@ jobs:
             gzip \
             zip \
             unzip \
-            tar
+            tar \
+            libxml2-utils \
+            jq
           git config --global --add safe.directory "${GITHUB_WORKSPACE}"
 
       - name: Install Maven from archive.apache.org
@@ -523,11 +525,17 @@ jobs:
           # Always-required: git is needed for the safe.directory
           # config in the emitted Dockerfile and for any release-
           # time git operation; ca-certificates is needed for
-          # cosign sign-blob; curl ditto.
+          # cosign sign-blob; curl ditto. libxml2-utils + jq are
+          # used by release.yml's discover step to walk the pom
+          # hierarchy and emit the matrix JSON — Maven itself
+          # doesn't invoke either, so the strace pass won't pick
+          # them up.
           {
             echo 'git'
             echo 'ca-certificates'
             echo 'curl'
+            echo 'libxml2-utils'
+            echo 'jq'
           } >> /tmp/scan/direct-packages.txt
           sort -u -o /tmp/scan/direct-packages.txt /tmp/scan/direct-packages.txt
 
@@ -750,19 +758,25 @@ jobs:
             echo "# stamps that immutability into this Dockerfile."
             echo "#"
             echo "# Chunked into batches so each RUN stays under Linux's"
-            echo "# MAX_ARG_STRLEN (~128 KB). 1390+ artifacts × ~400 char"
-            echo "# chain each is ~1.7 MB unchunked — exec aborts with"
-            echo "# 'argument list too long'. Batches of 100 are ~40 KB,"
-            echo "# comfortably under the limit; resulting layer count"
-            echo "# (a dozen or so) is well under Docker's 127-layer cap."
+            echo "# MAX_ARG_STRLEN (~128 KB) AND so the layer count stays"
+            echo "# under Docker's 127-layer cap. Batches of 250 hold us"
+            echo "# at ~100 KB per RUN; for keycloak-class projects with"
+            echo "# ~5000+ resolved artifacts that's ~20 layers, well"
+            echo "# under the Docker limit. Smaller batches (e.g. 100)"
+            echo "# blew the layer cap on Keycloak; 250 is the chosen"
+            echo "# middle ground — still under MAX_ARG_STRLEN with"
+            echo "# margin."
             echo "RUN mkdir -p /root/.m2/repository"
 
-            # Emit one RUN per CHUNK_SIZE artifacts. Resolves the
-            # MAX_ARG_STRLEN exec failure that blew up unchunked
-            # builds against any project with more than a few hundred
-            # transitively-resolved Maven artifacts (commons-lang3
-            # produced 1390).
-            CHUNK_SIZE=100
+            # Emit one RUN per CHUNK_SIZE artifacts. Bumped from 100
+            # to 250 to keep the layer count under Docker's 127
+            # cap for projects with thousands of dependencies
+            # (Keycloak resolves ~5000+; at 100/RUN = ~50 layers
+            # plus other layers exceeded the cap on early test
+            # runs). 250-entry batches stay well under MAX_ARG_STRLEN
+            # — each line is ~400 chars, 250 × 400 = 100 KB, vs
+            # the ~128 KB exec arg limit.
+            CHUNK_SIZE=250
             TOTAL=$(wc -l < /tmp/scan/maven-pins.txt)
             CHUNK_NUM=0
             COUNT=0

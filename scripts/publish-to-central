@@ -70,7 +70,7 @@ case "${PUBLISHING_TYPE}" in
   *) die "PUBLISHING_TYPE must be USER_MANAGED or AUTOMATIC (got: ${PUBLISHING_TYPE})" ;;
 esac
 
-for tool in gh gpg curl zip sha1sum md5sum awk base64; do
+for tool in gh gpg curl zip sha1sum md5sum awk base64 xmllint; do
   command -v "$tool" >/dev/null || die "$tool not found in PATH"
 done
 
@@ -124,13 +124,30 @@ mkdir bundle
 # artifactId, version) triple; sidecar artifacts (jar, sources,
 # javadoc, module) follow the artifactId-version-... naming convention
 # next to the pom in the release dir.
+#
+# XPath uses local-name() to handle the default
+# xmlns="http://maven.apache.org/POM/4.0.0" namespace. groupId and
+# version may be absent on the project node and inherited from
+# <parent>; artifactId is always present on the project. Targeting
+# the project node specifically is essential — a regex on
+# <groupId> would pick up the parent's coords first (textually
+# earlier) and mis-route every module artifact under the parent's
+# group path.
+xp() { xmllint --xpath "string($1)" "$2" 2>/dev/null || true; }
+
 for pom in downloads/*.pom; do
   [ -f "${pom}" ] || continue
   base=$(basename "${pom}" .pom)
 
-  groupId=$(awk -F'[<>]' '/<groupId>/{print $3; exit}' "${pom}" | tr -d ' \t')
-  artifactId=$(awk -F'[<>]' '/<artifactId>/{print $3; exit}' "${pom}" | tr -d ' \t')
-  version=$(awk -F'[<>]' '/<version>/{print $3; exit}' "${pom}" | tr -d ' \t')
+  groupId=$(xp '/*[local-name()="project"]/*[local-name()="groupId"]' "${pom}")
+  if [ -z "${groupId}" ]; then
+    groupId=$(xp '/*[local-name()="project"]/*[local-name()="parent"]/*[local-name()="groupId"]' "${pom}")
+  fi
+  artifactId=$(xp '/*[local-name()="project"]/*[local-name()="artifactId"]' "${pom}")
+  version=$(xp '/*[local-name()="project"]/*[local-name()="version"]' "${pom}")
+  if [ -z "${version}" ]; then
+    version=$(xp '/*[local-name()="project"]/*[local-name()="parent"]/*[local-name()="version"]' "${pom}")
+  fi
   [ -n "${groupId}" ] && [ -n "${artifactId}" ] && [ -n "${version}" ] \
     || die "could not parse groupId/artifactId/version from ${pom}"
 
