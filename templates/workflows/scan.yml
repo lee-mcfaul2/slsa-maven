@@ -426,6 +426,21 @@ jobs:
               sleep "${backoff}"
             done
           }
+          # libicu's package name embeds the version, which moves
+          # with Ubuntu releases (libicu74 on noble, libicu76+ on
+          # resolute). Detect the highest-versioned libicuNN
+          # available on the picked release rather than hardcoding.
+          # Required because the .NET runtime (used by kiota in
+          # frontend builds) hard-fails on missing ICU.
+          ICU_PKG=$(apt-cache search --names-only '^libicu[0-9]+$' 2>/dev/null \
+                    | awk '{print $1}' | sort -V | tail -1)
+          if [ -z "${ICU_PKG}" ]; then
+            echo "WARNING: no libicuNN found in apt; .NET-using build steps may fail" >&2
+            ICU_PKG=""
+          else
+            echo "Detected ICU package: ${ICU_PKG}"
+          fi
+
           apt_install \
             "${JDK_PACKAGE}" \
             strace \
@@ -441,7 +456,7 @@ jobs:
             tar \
             libxml2-utils \
             jq \
-            libicu74
+            ${ICU_PKG}
           git config --global --add safe.directory "${GITHUB_WORKSPACE}"
 
           # JAVA_HOME for the rest of this job AND for the emitted
