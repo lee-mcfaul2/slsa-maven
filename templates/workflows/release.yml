@@ -522,10 +522,13 @@ jobs:
   # Per-module verify: download the module's two passes, byte-
   # compare each artifact, attest provenance, sign with cosign.
   # needs: build waits for ALL build matrix entries to complete
-  # before any verify entry starts.
+  # before any verify entry starts. discover is also in needs so
+  # the matrix can read its verify_matrix output — needs is not
+  # transitive in GHA, so even though build->discover, verify
+  # must list discover explicitly to access its outputs.
   verify:
     name: Verify ${{ matrix.artifact_id }} (bit-compare + sign)
-    needs: build
+    needs: [discover, build]
     strategy:
       fail-fast: false
       matrix:
