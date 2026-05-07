@@ -503,6 +503,16 @@ jobs:
           echo "JAVA_HOME=${JAVA_HOME}" >> "$GITHUB_ENV"
           echo "JAVA_HOME pinned to ${JAVA_HOME} for the rest of this job and the emitted Dockerfile."
 
+          # Pin a UTF-8 locale. Stripped ubuntu base images default
+          # to LANG=C, which makes the JVM's default charset US-ASCII
+          # — any test that touches non-ASCII filenames or string
+          # contents (e.g. Apache Maven's PluginParameterExpression
+          # tests, which exercise unicode plugin parameters) blows
+          # up with InvalidPathException. C.UTF-8 is the locale the
+          # GHA runner default ships and what real user systems use.
+          echo "LANG=C.UTF-8" >> "$GITHUB_ENV"
+          echo "LC_ALL=C.UTF-8" >> "$GITHUB_ENV"
+
       - name: Install Maven from archive.apache.org
         # SHA512-pinned download. Apache's archive is content-
         # addressable + immutable like Maven Central, so the SHA
@@ -797,6 +807,12 @@ jobs:
             # lays out at /usr/lib/jvm/java-N-openjdk-amd64 but
             # doesn't export JAVA_HOME system-wide.
             echo "ENV JAVA_HOME=${JAVA_HOME}"
+            # UTF-8 locale baked in. Bare ubuntu images default to
+            # LANG=C; the JVM picks US-ASCII as its default charset
+            # under that, breaking any test that touches non-ASCII
+            # filenames or string contents.
+            echo "ENV LANG=C.UTF-8"
+            echo "ENV LC_ALL=C.UTF-8"
             echo ""
             echo "# Step 1: bootstrap ca-certificates so we can reach"
             echo "# the apt mirror over HTTPS."
