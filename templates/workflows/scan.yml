@@ -584,7 +584,7 @@ jobs:
 
           echo "trace_lines=$(wc -l < /tmp/scan/trace.log)" >> "$GITHUB_OUTPUT"
           echo "Trace: $(wc -l < /tmp/scan/trace.log) lines"
-          echo "M2 repo populated with $(find "${M2_REPO}" -type f ! -name '*.sha1' ! -name '*.md5' ! -name '*.sha256' ! -name '*.sha512' ! -name '_remote.repositories' ! -name '*.lastUpdated' ! -name 'resolver-status.properties' | wc -l) artifact files"
+          echo "M2 repo populated with $(find "${M2_REPO}" -type f ! -name '*.sha1' ! -name '*.md5' ! -name '*.sha256' ! -name '*.sha512' ! -name '_remote.repositories' ! -name '*.lastUpdated' ! -name 'resolver-status.properties' ! -name 'maven-metadata-*.xml' ! -name 'maven-metadata.xml' ! -path '*/.meta/*' | wc -l) artifact files"
 
       - name: Extract apt paths from trace
         run: |
@@ -746,6 +746,24 @@ jobs:
         #                                        timestamp; not in
         #                                        Central layout.
         #   resolver-status.properties         — same.
+        #   maven-metadata*.xml                — repository version-
+        #                                        list metadata.
+        #                                        MUTABLE — Central
+        #                                        regenerates it
+        #                                        every time a new
+        #                                        version of the
+        #                                        artifact is
+        #                                        published; pinning
+        #                                        by SHA would 404
+        #                                        the next time
+        #                                        Central updates.
+        #                                        mvn -o doesn't
+        #                                        need it.
+        #   .meta/* paths                      — resolver hint
+        #                                        files (prefix
+        #                                        lookup, etc).
+        #                                        Mutable, same
+        #                                        reason.
         run: |
           set -euo pipefail
           export M2_REPO="${GITHUB_WORKSPACE}/.m2-scan"
@@ -774,6 +792,9 @@ jobs:
               ! -name '_remote.repositories' \
               ! -name '*.lastUpdated' \
               ! -name 'resolver-status.properties' \
+              ! -name 'maven-metadata-*.xml' \
+              ! -name 'maven-metadata.xml' \
+              ! -path '*/.meta/*' \
               | sort)
 
           echo "Maven pins: $(wc -l < /tmp/scan/maven-pins.txt)"
