@@ -863,10 +863,14 @@ jobs:
             echo ""
             echo "# Step 1: bootstrap ca-certificates so we can reach"
             echo "# the apt mirror over HTTPS."
-            echo "RUN apt-get update -qq \\"
-            echo " && apt-get install -y --no-install-recommends ca-certificates"
+            echo "RUN apt-get -o Acquire::Retries=10 -o Acquire::http::Timeout=60 update -qq \\"
+            echo " && apt-get -o Acquire::Retries=10 -o Acquire::http::Timeout=60 install -y --no-install-recommends ca-certificates"
             echo ""
             echo "# Step 2: redirect apt to the pinned snapshot."
+            # apt-get update against snapshot.ubuntu.com regularly
+            # 503s under GHA-runner egress IP rate limits; same
+            # retry options as the download step let apt's per-fetch
+            # retry ride out short clusters.
             echo "RUN set -eu \\"
             echo " && printf '%s\\n' \\"
             echo "    'deb ${APT_MIRROR_URL} ${RELEASE} main restricted universe multiverse' \\"
@@ -874,7 +878,7 @@ jobs:
             echo "    'deb ${APT_MIRROR_URL} ${RELEASE}-security main restricted universe multiverse' \\"
             echo "    > /etc/apt/sources.list \\"
             echo " && rm -f /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list \\"
-            echo " && apt-get update -qq"
+            echo " && apt-get -o Acquire::Retries=10 -o Acquire::http::Timeout=60 update -qq"
             echo ""
             echo "# Step 3: download each pinned .deb, verify its SHA256,"
             echo "# install. Single RUN so failure aborts the layer atomically."
