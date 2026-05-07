@@ -123,10 +123,16 @@ jobs:
         run: |
           set -euo pipefail
           for attempt in 1 2 3 4 5 6; do
+            # Bracket apt-get with set +e/-e — same reason as the
+            # scan job's apt_install: a failed pipeline trips
+            # set -euo pipefail before the retry-check runs.
+            set +e
             sudo apt-get -o Acquire::http::Timeout=30 \
                          -o Acquire::Retries=3 \
                          update -qq 2>&1 | tee /tmp/apt-update.log
-            if [ "${PIPESTATUS[0]}" = "0" ] && ! grep -q 'Failed to fetch' /tmp/apt-update.log; then
+            rc=${PIPESTATUS[0]}
+            set -e
+            if [ "${rc}" = "0" ] && ! grep -q 'Failed to fetch' /tmp/apt-update.log; then
               break
             fi
             if [ "${attempt}" = "6" ]; then
@@ -385,9 +391,16 @@ jobs:
           # single-blip transients; rate-limit cool-off needs
           # minutes — hence the exponential outer retry.
           for attempt in 1 2 3 4 5 6; do
+            # Bracket apt-get with set +e/-e — same reason as the
+            # Install bootstrap toolchain step: a failed pipeline
+            # under set -euo pipefail aborts before the
+            # Failed-to-fetch check, defeating the retry.
+            set +e
             apt-get -o Acquire::Retries=5 -o Acquire::http::Pipeline-Depth=1 \
                     update 2>&1 | tee /tmp/apt-update.log
-            if ! grep -q 'Failed to fetch' /tmp/apt-update.log; then
+            rc=${PIPESTATUS[0]}
+            set -e
+            if [ "${rc}" = "0" ] && ! grep -q 'Failed to fetch' /tmp/apt-update.log; then
               break
             fi
             if [ "${attempt}" = "6" ]; then
@@ -416,10 +429,18 @@ jobs:
           set -euo pipefail
           apt_install() {
             for attempt in 1 2 3 4 5 6; do
+              # Bracket apt-get with set +e/-e so a failed pipeline
+              # doesn't trip the outer set -euo pipefail before the
+              # retry-loop check runs. Without this, the first 503
+              # / 502 cluster from snapshot.ubuntu.com kills the
+              # whole script — the retry loop never gets a chance.
+              set +e
               apt-get -o Acquire::Retries=5 -o Acquire::http::Pipeline-Depth=1 \
                       install -y --no-install-recommends "$@" 2>&1 \
                 | tee /tmp/apt-install.log
-              if [ "${PIPESTATUS[0]}" = "0" ] && ! grep -q 'Failed to fetch' /tmp/apt-install.log; then
+              rc=${PIPESTATUS[0]}
+              set -e
+              if [ "${rc}" = "0" ] && ! grep -q 'Failed to fetch' /tmp/apt-install.log; then
                 return 0
               fi
               if [ "${attempt}" = "6" ]; then
@@ -428,7 +449,7 @@ jobs:
                 return 1
               fi
               backoff=$((60 * (1 << (attempt - 1))))
-              echo "snapshot.ubuntu.com 503 — known GHA-runner rate-limiting; sleeping ${backoff}s." >&2
+              echo "snapshot.ubuntu.com 503/502 — known GHA-runner rate-limiting; sleeping ${backoff}s." >&2
               sleep "${backoff}"
             done
           }
