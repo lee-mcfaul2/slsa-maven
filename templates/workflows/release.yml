@@ -137,13 +137,16 @@ jobs:
         # ANSI / progress spinner.
         # `verify` is the broadest pre-release gate: compile +
         # test (Surefire) + package + integration-test (Failsafe)
-        # + verify-phase plugins (RAT, Enforcer rules). For
+        # + verify-phase plugins (Enforcer rules etc). For
         # multi-module reactors, mvn applies these phases to every
         # project in topological order — single command covers the
         # whole reactor.
+        # -Drat.skip=true mirrors the same skip in scan.yml's
+        # BUILD_CMD: license headers are project CI's concern,
+        # not part of the release contract.
         run: |
           set -euo pipefail
-          mvn -o -B verify
+          mvn -o -B -Drat.skip=true verify
 
   # Walk the pom hierarchy and emit a JSON matrix describing every
   # module in the default reactor. Profile-activated modules are

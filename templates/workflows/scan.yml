@@ -545,7 +545,20 @@ jobs:
           # maven-help-plugin lands in the local repo — release.yml
           # uses it offline to read project.artifactId and
           # project.version, so it has to be cached by the scan.
-          BUILD_CMD="mvn -B -Dmaven.repo.local=${M2_REPO} verify source:jar javadoc:jar && mvn -B -Dmaven.repo.local=${M2_REPO} -q -DforceStdout help:evaluate -Dexpression=project.artifactId"
+          #
+          # Skip flags:
+          #   -Drat.skip=true       — apache-rat-plugin is bound to
+          #                           verify and runs license-header
+          #                           checks. Many projects (Apache
+          #                           Maven itself) require a
+          #                           profile like -Papache-release
+          #                           to configure RAT correctly;
+          #                           the default config flags
+          #                           hundreds of legitimate files.
+          #                           Scan is a cache builder, not a
+          #                           license gate — let the
+          #                           project's own CI handle that.
+          BUILD_CMD="mvn -B -Dmaven.repo.local=${M2_REPO} -Drat.skip=true verify source:jar javadoc:jar && mvn -B -Dmaven.repo.local=${M2_REPO} -q -DforceStdout help:evaluate -Dexpression=project.artifactId"
           echo "Build command: ${BUILD_CMD}"
 
           # Trace. -f follows forks (Maven forks compiler / surefire
