@@ -584,7 +584,7 @@ jobs:
 
           echo "trace_lines=$(wc -l < /tmp/scan/trace.log)" >> "$GITHUB_OUTPUT"
           echo "Trace: $(wc -l < /tmp/scan/trace.log) lines"
-          echo "M2 repo populated with $(find "${M2_REPO}" -type f \( -name '*.jar' -o -name '*.pom' -o -name '*.module' \) | wc -l) artifact files"
+          echo "M2 repo populated with $(find "${M2_REPO}" -type f ! -name '*.sha1' ! -name '*.md5' ! -name '*.sha256' ! -name '*.sha512' ! -name '_remote.repositories' ! -name '*.lastUpdated' ! -name 'resolver-status.properties' | wc -l) artifact files"
 
       - name: Extract apt paths from trace
         run: |
@@ -722,12 +722,30 @@ jobs:
         # segments (dots → slashes) / artifactId / version / file.
         # That makes URL reconstruction mechanical.
         #
-        # Capture .jar, .pom, and .module (Gradle module metadata
-        # — some artifacts publish it alongside the pom, mvn caches
-        # it). Skip .sha1, .md5, and _remote.repositories: the
-        # checksum sidecars are recomputable; _remote.repositories
-        # is locally-generated tracking metadata that mvn -o
-        # doesn't need.
+        # Capture every file under ${M2_REPO} EXCEPT known
+        # locally-generated metadata + recomputable checksum
+        # sidecars. The previous restrictive allowlist
+        # (.jar/.pom/.module only) missed real artifact types like
+        # .zip / .tar.gz / .war / .aar / native libraries — surfaced
+        # when maven-executor's dependency:unpack failed offline
+        # against apache-maven-3.9.14-bin.zip that scan never
+        # captured. Pinning everything is safer than allowlisting
+        # types we know about today.
+        #
+        # Excludes:
+        #   *.sha1, *.md5, *.sha256, *.sha512  — checksum sidecars
+        #                                        published next to
+        #                                        artifacts; mvn -o
+        #                                        recomputes them
+        #                                        from the artifact
+        #                                        bytes.
+        #   _remote.repositories               — locally-generated
+        #                                        repo tracking; mvn
+        #                                        -o doesn't need it.
+        #   *.lastUpdated                      — repository check
+        #                                        timestamp; not in
+        #                                        Central layout.
+        #   resolver-status.properties         — same.
         run: |
           set -euo pipefail
           export M2_REPO="${GITHUB_WORKSPACE}/.m2-scan"
@@ -748,7 +766,15 @@ jobs:
             rel="${f#${M2_REPO}/}"
             sha=$(sha256sum "${f}" | awk '{print $1}')
             printf '%s\t%s\n' "${sha}" "${rel}" >> /tmp/scan/maven-pins.txt
-          done < <(find "${M2_REPO}" -type f \( -name '*.jar' -o -name '*.pom' -o -name '*.module' \) | sort)
+          done < <(find "${M2_REPO}" -type f \
+              ! -name '*.sha1' \
+              ! -name '*.md5' \
+              ! -name '*.sha256' \
+              ! -name '*.sha512' \
+              ! -name '_remote.repositories' \
+              ! -name '*.lastUpdated' \
+              ! -name 'resolver-status.properties' \
+              | sort)
 
           echo "Maven pins: $(wc -l < /tmp/scan/maven-pins.txt)"
           if [ ! -s /tmp/scan/maven-pins.txt ]; then
