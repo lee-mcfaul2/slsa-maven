@@ -454,9 +454,15 @@ jobs:
             jar|maven-plugin)
               # All three goals in one invocation. -am brings in
               # in-reactor deps (built in place, not installed).
+              # -Drat.skip=true: maven-parent binds apache-rat-plugin
+              # at validate/initialize phase (not just verify), so
+              # `mvn package` triggers it. We don't want license-
+              # header checks to fail per-module builds — same
+              # rationale as scan.yml's BUILD_CMD.
               mvn -o -B \
                   "${PL_FLAGS[@]}" \
                   -DskipTests \
+                  -Drat.skip=true \
                   -Dproject.build.outputTimestamp="$ISO_TS" \
                   -Dnotimestamp=true \
                   package source:jar javadoc:jar
