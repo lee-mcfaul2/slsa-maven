@@ -859,7 +859,14 @@ jobs:
             echo "# install. Single RUN so failure aborts the layer atomically."
             echo "RUN set -eux \\"
             echo " && mkdir -p /tmp/debs && cd /tmp/debs \\"
-            echo " && apt-get download \\"
+            # Acquire::Retries=10 + Acquire::http::Timeout=60 give
+            # apt's per-fetch retry enough room to ride out
+            # snapshot.ubuntu.com's 503 clusters (the GHA runner IP
+            # pool gets rate-limited during peak hours). Without
+            # these, the build-container apt-get download just
+            # gives up on the first 503 wave and the image build
+            # has to be re-triggered manually.
+            echo " && apt-get -o Acquire::Retries=10 -o Acquire::http::Timeout=60 download \\"
 
             sort -k1,1 /tmp/scan/apt-pins.txt \
               | awk -F'\t' '{ printf "      %s=%s \\\n", $1, $2 }'
